@@ -1,0 +1,164 @@
+
+{% extends "base.html" %}
+
+{% block title %}Dashboard - MIS Configuration{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+    <div class="mb-8">
+        <h2 class="text-4xl font-bold text-gray-800 mb-2">
+            <i class="fas fa-tachometer-alt text-blue-600"></i> Welcome, {{ current_user.Username }}!
+        </h2>
+        <p class="text-gray-600">{{ current_user.role.RoleName }} Dashboard - {{ current_user.department.DeptName }} Department</p>
+    </div>
+    
+    <!-- Statistics Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div class="stat-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <i class="fas fa-users text-3xl mb-3 opacity-80"></i>
+            <div class="stat-value">{{ stats.total_users }}</div>
+            <div class="stat-label">Total Users</div>
+        </div>
+        
+        <div class="stat-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <i class="fas fa-building text-3xl mb-3 opacity-80"></i>
+            <div class="stat-value">{{ stats.total_depts }}</div>
+            <div class="stat-label">Departments</div>
+        </div>
+        
+        <div class="stat-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <i class="fas fa-upload text-3xl mb-3 opacity-80"></i>
+            <div class="stat-value">{{ stats.total_uploads }}</div>
+            <div class="stat-label">Total Uploads</div>
+        </div>
+        
+        <div class="stat-card" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">
+            <i class="fas fa-calendar-alt text-3xl mb-3 opacity-80"></i>
+            <div class="stat-value text-xl">{{ stats.active_fy }}</div>
+            <div class="stat-label">Active Financial Year</div>
+        </div>
+    </div>
+    
+    <!-- Quick Actions -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {% if current_user.role.RoleName == 'Admin' %}
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-blue-100 p-3 rounded-lg">
+                    <i class="fas fa-cog text-blue-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Configuration Master</h3>
+                    <p class="text-gray-600 mb-4 text-sm">Manage companies, financial years, and departments</p>
+                    <a href="{{ url_for('config_master') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-arrow-right mr-2"></i> Manage Configuration
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-purple-100 p-3 rounded-lg">
+                    <i class="fas fa-users text-purple-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">User Management</h3>
+                    <p class="text-gray-600 mb-4 text-sm">Create and manage user accounts</p>
+                    <a href="{{ url_for('user_management') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-user-plus mr-2"></i> Manage Users
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-green-100 p-3 rounded-lg">
+                    <i class="fas fa-file-excel text-green-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Template Management</h3>
+                    <p class="text-gray-600 mb-4 text-sm">Upload department-specific Excel templates</p>
+                    <a href="{{ url_for('template_management') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-file-upload mr-2"></i> Manage Templates
+                    </a>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if current_user.role.RoleName in ['Admin', 'HOD'] %}
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-orange-100 p-3 rounded-lg">
+                    <i class="fas fa-upload text-orange-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">MIS Upload</h3>
+                    <p class="text-gray-600 mb-4 text-sm">Upload monthly MIS reports (1st-10th of month)</p>
+                    <a href="{{ url_for('mis_upload') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-cloud-upload-alt mr-2"></i> Upload MIS
+                    </a>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+        
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-cyan-100 p-3 rounded-lg">
+                    <i class="fas fa-chart-bar text-cyan-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Reports & Analytics</h3>
+                    <p class="text-gray-600 mb-4 text-sm">View and download comprehensive MIS reports</p>
+                    <a href="{{ url_for('reports') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-chart-line mr-2"></i> View Reports
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        {% if current_user.role.RoleName in ['Admin', 'HOD'] %}
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-pink-100 p-3 rounded-lg">
+                    <i class="fas fa-tasks text-pink-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Approval Queue</h3>
+                    <p class="text-gray-600 mb-4 text-sm">Review and approve pending MIS uploads</p>
+                    <a href="{{ url_for('approval_queue') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-check-double mr-2"></i> Review Uploads
+                    </a>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    
+    <!-- Recent Activity -->
+    <div class="mt-8 card p-6">
+        <h3 class="text-2xl font-bold mb-4 text-gray-800 flex items-center gap-2">
+            <i class="fas fa-history text-blue-600"></i> Recent Activity
+        </h3>
+        <div class="space-y-3">
+            {% for upload in stats.recent_uploads %}
+            <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                <div class="flex items-center gap-3">
+                    <i class="fas fa-file-excel text-green-600"></i>
+                    <div>
+                        <p class="font-semibold text-gray-800">{{ upload.department.DeptName }} - {{ ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][upload.MonthID] }} {{ upload.financial_year.FYName }}</p>
+                        <p class="text-sm text-gray-600">Uploaded by {{ upload.uploader.Username }} on {{ upload.UploadDate.strftime('%d %b %Y') }}</p>
+                    </div>
+                </div>
+                <span class="badge badge-{{ upload.Status.lower() }}">
+                    {{ upload.Status }}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}

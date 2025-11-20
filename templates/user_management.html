@@ -1,0 +1,121 @@
+
+{% extends "base.html" %}
+
+{% block title %}User Management - MIS Configuration{% endblock %}
+
+{% block content %}
+<script>
+function toggleEditUser(userId) {
+    const editForm = document.getElementById('edit-user-form-' + userId);
+    const actionButtons = document.getElementById('action-user-buttons-' + userId);
+    
+    if (editForm.classList.contains('hidden')) {
+        editForm.classList.remove('hidden');
+        actionButtons.classList.add('hidden');
+    } else {
+        editForm.classList.add('hidden');
+        actionButtons.classList.remove('hidden');
+    }
+}
+</script>
+<div class="max-w-6xl mx-auto">
+    <h2 class="text-3xl font-bold mb-6">User Management</h2>
+    
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <h3 class="text-xl font-bold mb-4">Create New User</h3>
+            <form method="POST" action="{{ url_for('add_user') }}">
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Username</label>
+                    <input type="text" name="username" required class="w-full px-3 py-2 border rounded">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Email</label>
+                    <input type="email" name="email" required class="w-full px-3 py-2 border rounded">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Password</label>
+                    <input type="password" name="password" required class="w-full px-3 py-2 border rounded">
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Department</label>
+                    <select name="department_id" required class="w-full px-3 py-2 border rounded">
+                        {% for dept in departments %}
+                        {% if dept.ActiveFlag %}
+                        <option value="{{ dept.DeptID }}">{{ dept.DeptName }}</option>
+                        {% endif %}
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Role</label>
+                    <select name="role_id" required class="w-full px-3 py-2 border rounded">
+                        {% for role in roles %}
+                        <option value="{{ role.RoleID }}">{{ role.RoleName }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <button type="submit" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700">Create User</button>
+            </form>
+        </div>
+        
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <h3 class="text-xl font-bold mb-4">Existing Users</h3>
+            <div class="space-y-2 overflow-y-auto max-h-96">
+                {% for user in users %}
+                <div class="p-3 bg-gray-50 rounded border border-gray-200">
+                    <div class="flex justify-between items-start mb-2">
+                        <div>
+                            <p class="font-bold">{{ user.Username }}</p>
+                            <p class="text-sm text-gray-600">{{ user.Email }}</p>
+                            <p class="text-sm text-gray-600">{{ user.department.DeptName }} - {{ user.role.RoleName }}</p>
+                        </div>
+                        <form method="POST" action="{{ url_for('toggle_user', user_id=user.UserID) }}" class="inline">
+                            <button type="submit" class="text-xs px-2 py-1 rounded {% if user.IsActive %}bg-green-100 text-green-700 hover:bg-green-200{% else %}bg-red-100 text-red-700 hover:bg-red-200{% endif %}">
+                                {{ 'Active' if user.IsActive else 'Inactive' }}
+                            </button>
+                        </form>
+                    </div>
+                    
+                    <!-- Edit Form (Hidden by default) -->
+                    <form method="POST" action="{{ url_for('edit_user', user_id=user.UserID) }}" id="edit-user-form-{{ user.UserID }}" class="hidden mb-2">
+                        <input type="text" name="username" value="{{ user.Username }}" required class="w-full px-2 py-1 border rounded text-sm mb-1">
+                        <input type="email" name="email" value="{{ user.Email }}" required class="w-full px-2 py-1 border rounded text-sm mb-1">
+                        <input type="password" name="password" placeholder="New Password (leave empty to keep current)" class="w-full px-2 py-1 border rounded text-sm mb-1">
+                        <select name="department_id" required class="w-full px-2 py-1 border rounded text-sm mb-1">
+                            {% for dept in departments %}
+                            <option value="{{ dept.DeptID }}" {% if dept.DeptID == user.DepartmentID %}selected{% endif %}>{{ dept.DeptName }}</option>
+                            {% endfor %}
+                        </select>
+                        <select name="role_id" required class="w-full px-2 py-1 border rounded text-sm mb-2">
+                            {% for role in roles %}
+                            <option value="{{ role.RoleID }}" {% if role.RoleID == user.RoleID %}selected{% endif %}>{{ role.RoleName }}</option>
+                            {% endfor %}
+                        </select>
+                        <div class="flex gap-2">
+                            <button type="submit" class="flex-1 bg-blue-600 text-white text-xs py-1 rounded hover:bg-blue-700">
+                                <i class="fas fa-save mr-1"></i> Save
+                            </button>
+                            <button type="button" onclick="toggleEditUser({{ user.UserID }})" class="flex-1 bg-gray-400 text-white text-xs py-1 rounded hover:bg-gray-500">
+                                <i class="fas fa-times mr-1"></i> Cancel
+                            </button>
+                        </div>
+                    </form>
+                    
+                    <div class="flex gap-2" id="action-user-buttons-{{ user.UserID }}">
+                        <button onclick="toggleEditUser({{ user.UserID }})" class="flex-1 bg-yellow-500 text-white text-xs py-1 rounded hover:bg-yellow-600">
+                            <i class="fas fa-edit mr-1"></i> Edit
+                        </button>
+                        <form method="POST" action="{{ url_for('delete_user', user_id=user.UserID) }}" class="flex-1" onsubmit="return confirm('Are you sure you want to delete {{ user.Username }}? This action cannot be undone if the user has no associated data.');">
+                            <button type="submit" class="w-full bg-red-600 text-white text-xs py-1 rounded hover:bg-red-700">
+                                <i class="fas fa-trash mr-1"></i> Delete
+                            </button>
+                        </form>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
