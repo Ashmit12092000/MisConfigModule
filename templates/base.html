@@ -1,63 +1,112 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}MIS Configuration{% endblock %}</title>
+    <title>{% block title %}MANAGEMENT INFORMATION SYSTEM{% endblock %}</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body class="bg-gray-50 min-h-screen">
     {% if 'user_id' in session %}
-    <nav class="bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg">
-        <div class="container mx-auto px-4 py-3">
-            <div class="flex flex-wrap justify-between items-center">
+    <nav class="bg-gradient-to-r from-blue-600 to-blue-800 text-white shadow-lg">
+        <div class="container mx-auto px-4 py-4">
+            <!-- Top Section: Logo and Title -->
+            <div class="flex justify-between items-center mb-3">
                 <div class="flex items-center gap-3">
-                    <i class="fas fa-chart-line text-2xl"></i>
-                    <h1 class="text-xl font-bold">MIS Configuration System</h1>
-                </div>
-                <div class="flex flex-wrap gap-6 items-center">
-                    <div class="flex items-center gap-2 bg-blue-700 px-3 py-1 rounded-full">
-                        <i class="fas fa-user-circle"></i>
-                        <span class="text-sm font-medium">{{ current_user.Username }}</span>
-                        <span class="text-xs opacity-75">({{ current_user.role.RoleName }})</span>
+                    <img src="{{ url_for('static', filename='logo.png') }}" alt="KSPL Logo" class="w-12 h-12 object-contain">
+                    <div>
+                        <h1 class="text-xl font-bold">MIS System</h1>
+                        <p class="text-xs opacity-75">Management Information System</p>
                     </div>
-                    <a href="{{ url_for('dashboard') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-home mr-1"></i> Dashboard
+                </div>
+
+                <!-- User Info Badge -->
+                <div class="flex items-center gap-3">
+                    <div class="text-right hidden sm:block">
+                        <p class="text-sm font-semibold">{{ current_user.EmpID }}</p>
+                        {% if current_user.Username %}<p class="text-xs opacity-75">{{ current_user.Username }}</p>{% endif %}
+                        <span class="inline-block mt-1 px-2 py-0.5 bg-blue-500 rounded-full text-xs font-medium">
+                            {{ current_user.role.RoleName }}
+                        </span>
+                    </div>
+                    <div class="w-10 h-10 bg-blue-500 rounded-full flex items-center justify-center">
+                        <i class="fas fa-user text-white"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Navigation Links -->
+            <div class="flex flex-wrap gap-1 items-center">
+                <!-- Primary Navigation -->
+                <a href="{{ url_for('dashboard') }}" class="nav-link-modern">
+                    <i class="fas fa-home mr-2"></i>Dashboard
+                </a>
+
+                <div class="nav-separator"></div>
+
+                <!-- Admin Only Section -->
+                {% if current_user.role.RoleName == 'Admin' %}
+                <div class="flex flex-wrap gap-1 items-center">
+                    <span class="px-2 py-1 text-xs font-semibold opacity-75">Admin</span>
+                    <a href="{{ url_for('config_master') }}" class="nav-link-modern">
+                        <i class="fas fa-cog mr-1"></i>Configuration
                     </a>
-                    {% if current_user.role.RoleName == 'Admin' %}
-                    <a href="{{ url_for('config_master') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-cog mr-1"></i> Configuration
+                    <a href="{{ url_for('department_management') }}" class="nav-link-modern">
+                        <i class="fas fa-building mr-1"></i>Departments
                     </a>
-                    <a href="{{ url_for('department_management') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-building mr-1"></i> Departments
+                    <a href="{{ url_for('user_management') }}" class="nav-link-modern">
+                        <i class="fas fa-users mr-1"></i>Users
                     </a>
-                    <a href="{{ url_for('user_management') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-users mr-1"></i> Users
+                    <a href="{{ url_for('template_management') }}" class="nav-link-modern">
+                        <i class="fas fa-file-excel mr-1"></i>Templates
                     </a>
-                    <a href="{{ url_for('template_management') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-file-excel mr-1"></i> Templates
-                    </a>
-                    {% endif %}
-                    {% if current_user.role.RoleName in ['Admin', 'HOD'] %}
-                    <a href="{{ url_for('mis_upload') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-upload mr-1"></i> MIS Upload
-                    </a>
-                    {% endif %}
-                    <a href="{{ url_for('reports') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-chart-bar mr-1"></i> Reports
-                    </a>
-                    <a href="{{ url_for('logout') }}" class="nav-link hover:text-blue-200 transition">
-                        <i class="fas fa-sign-out-alt mr-1"></i> Logout
+                </div>
+                <div class="nav-separator"></div>
+                {% endif %}
+
+                <!-- Upload Section -->
+                {% if current_user.role.RoleName in ['Admin', 'HOD'] %}
+                <a href="{{ url_for('mis_upload') }}" class="nav-link-modern nav-link-highlight">
+                    <i class="fas fa-cloud-upload-alt mr-1"></i>MIS Upload
+                </a>
+                <div class="nav-separator"></div>
+                {% endif %}
+
+                <!-- HOD Only Section -->
+                {% if current_user.role.RoleName == 'HOD' %}
+                <a href="{{ url_for('my_uploads') }}" class="nav-link-modern">
+                    <i class="fas fa-file-upload mr-1"></i>My Uploads
+                </a>
+                <div class="nav-separator"></div>
+                {% endif %}
+
+                <!-- Management Role Section -->
+                {% if current_user.role.RoleName == 'Management' %}
+                <a href="{{ url_for('approval_queue') }}" class="nav-link-modern nav-link-highlight">
+                    <i class="fas fa-tasks mr-1"></i>Approval Queue
+                </a>
+                <div class="nav-separator"></div>
+                {% endif %}
+
+                <!-- Reports -->
+                <a href="{{ url_for('reports') }}" class="nav-link-modern">
+                    <i class="fas fa-chart-bar mr-1"></i>Reports
+                </a>
+
+                <!-- Logout -->
+                <div class="ml-auto flex items-center gap-1">
+                    <a href="{{ url_for('logout') }}" class="nav-link-modern hover:bg-red-500">
+                        <i class="fas fa-sign-out-alt mr-1"></i>Logout
                     </a>
                 </div>
             </div>
         </div>
     </nav>
     {% endif %}
-    
+
     <div class="container mx-auto px-4 py-6">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
@@ -69,13 +118,13 @@
                 {% endfor %}
             {% endif %}
         {% endwith %}
-        
+
         {% block content %}{% endblock %}
     </div>
-    
+
     <footer class="bg-gray-800 text-white mt-12 py-6">
         <div class="container mx-auto px-4 text-center">
-            <p class="text-sm">&copy; 2024 MIS Configuration System. All rights reserved.</p>
+            <p class="text-sm">&copy; 2025 MANAGEMENT INFORMATION SYSTEM. All rights reserved.</p>
         </div>
     </footer>
 </body>

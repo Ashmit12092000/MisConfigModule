@@ -1,17 +1,32 @@
 import os
 import bcrypt
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
 from sqlalchemy import event
+from email_service import email_service
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import logging
+import pytz
+from config import (
+    UPLOAD_WINDOW_START_DAY, UPLOAD_WINDOW_END_DAY,
+    UPLOAD_WINDOW_REMINDER_DAY, UPLOAD_LOCK_DAY,
+    UPLOAD_WINDOW_OPEN_HOUR, UPLOAD_WINDOW_OPEN_MINUTE,
+    UPLOAD_WINDOW_REMINDER_HOUR, UPLOAD_WINDOW_REMINDER_MINUTE,
+    UPLOAD_WINDOW_LOCK_HOUR, UPLOAD_WINDOW_LOCK_MINUTE
+)
+
+# Set IST timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SESSION_SECRET', 'dev-secret-key-change-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///mis_config.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -50,37 +65,61 @@ class FinancialYear(db.Model):
 class User(db.Model):
     __tablename__ = 'users'
     UserID = db.Column(db.Integer, primary_key=True)
-    Username = db.Column(db.String(50), unique=True, nullable=False)
+    EmpID = db.Column(db.String(20), unique=True, nullable=False, index=True)
+    Username = db.Column(db.String(50), nullable=True)
     PasswordHash = db.Column(db.String(255), nullable=False)
     Email = db.Column(db.String(100), unique=True, nullable=False)
     DepartmentID = db.Column(db.Integer, db.ForeignKey('departments.DeptID'), nullable=False)
     RoleID = db.Column(db.Integer, db.ForeignKey('roles.RoleID'), nullable=False)
     IsActive = db.Column(db.Boolean, default=True)
+    FailedLoginAttempts = db.Column(db.Integer, default=0)
+    LastFailedLogin = db.Column(db.DateTime, nullable=True)
+    AccountLockedUntil = db.Column(db.DateTime, nullable=True)
+    PasswordLastChanged = db.Column(db.DateTime, default=lambda: datetime.now(IST))
+    PasswordExpiryDate = db.Column(db.DateTime, default=lambda: datetime.now(IST) + timedelta(days=90))
+    CreatedAt = db.Column(db.DateTime, default=lambda: datetime.now(IST))
+    UpdatedAt = db.Column(db.DateTime, default=lambda: datetime.now(IST), onupdate=lambda: datetime.now(IST))
     uploads = db.relationship('MISUpload', backref='uploader', lazy=True)
 
 class MISUpload(db.Model):
     __tablename__ = 'mis_uploads'
     UploadID = db.Column(db.Integer, primary_key=True)
+    UploadCode = db.Column(db.String(50), unique=True, nullable=True)
     DepartmentID = db.Column(db.Integer, db.ForeignKey('departments.DeptID'), nullable=False)
     MonthID = db.Column(db.Integer, nullable=False)
     FYID = db.Column(db.Integer, db.ForeignKey('financial_years.FYID'), nullable=False)
     UploadedBy = db.Column(db.Integer, db.ForeignKey('users.UserID'), nullable=False)
-    UploadDate = db.Column(db.DateTime, default=datetime.utcnow)
+    UploadDate = db.Column(db.DateTime, default=lambda: datetime.now(IST))
     FilePath = db.Column(db.String(255), nullable=False)
-    Status = db.Column(db.String(50), default='Pending')
+    FileCheck = db.Column(db.String(50), default='Not Validated')
+    Status = db.Column(db.String(50), default='In Review')
 
 class Template(db.Model):
     __tablename__ = 'templates'
     TemplateID = db.Column(db.Integer, primary_key=True)
     DepartmentID = db.Column(db.Integer, db.ForeignKey('departments.DeptID'), nullable=False)
     FilePath = db.Column(db.String(255), nullable=False)
-    UploadDate = db.Column(db.DateTime, default=datetime.utcnow)
+    UploadDate = db.Column(db.DateTime, default=lambda: datetime.now(IST))
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(password, hashed):
     return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def generate_mis_code(department_id):
+    """Generate unique MIS code in format: MIS+DPT+[code]"""
+    dept = Department.query.get(department_id)
+    if not dept:
+        return None
+    
+    dept_code = dept.DeptName[:3].upper()
+    
+    # Count existing uploads for this department to generate sequential code
+    upload_count = MISUpload.query.filter_by(DepartmentID=department_id).count()
+    sequential_code = str(upload_count + 1).zfill(6)
+    
+    return f"MIS{dept_code}{sequential_code}"
 
 def login_required(f):
     from functools import wraps
@@ -128,14 +167,38 @@ def hod_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def management_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please log in to access this page.', 'error')
+            return redirect(url_for('login'))
+        user = User.query.get(session['user_id'])
+        if not user or not user.IsActive:
+            session.clear()
+            flash('Your session has expired. Please log in again.', 'error')
+            return redirect(url_for('login'))
+        if user.role.RoleName != 'Management':
+            flash('Access denied. Management privileges required.', 'error')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
+
 def check_upload_window():
     today = date.today()
-    if 1 <= today.day <= 10:
-        return True, "Upload window is open (1st-10th of the month)."
-    elif today.day > 10:
-        return False, "Upload window closed for the current month. Window opens on the 1st of next month."
+    if UPLOAD_WINDOW_START_DAY <= today.day <= UPLOAD_WINDOW_END_DAY:
+        days_remaining = UPLOAD_WINDOW_END_DAY - today.day
+        if days_remaining == 0:
+            return True, f"Upload window is open ({UPLOAD_WINDOW_START_DAY}st-{UPLOAD_WINDOW_END_DAY}th of the month). Last day to upload!"
+        elif days_remaining == 1:
+            return True, f"Upload window is open ({UPLOAD_WINDOW_START_DAY}st-{UPLOAD_WINDOW_END_DAY}th of the month). 1 day remaining."
+        else:
+            return True, f"Upload window is open ({UPLOAD_WINDOW_START_DAY}st-{UPLOAD_WINDOW_END_DAY}th of the month). {days_remaining} days remaining."
+    elif today.day > UPLOAD_WINDOW_END_DAY:
+        return False, f"Upload window is closed. The upload window opens on the {UPLOAD_WINDOW_START_DAY}st of next month."
     else:
-        return False, "Upload window opens on the 1st of the month."
+        return False, f"Upload window opens on the {UPLOAD_WINDOW_START_DAY}st of the month."
 
 def validate_excel_file(file_path):
     """Validate Excel file structure and content"""
@@ -166,19 +229,109 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form.get('username')
+        emp_id = request.form.get('emp_id')
         password = request.form.get('password')
         
-        user = User.query.filter_by(Username=username).first()
+        user = User.query.filter_by(EmpID=emp_id).first()
         
-        if user and user.IsActive and verify_password(password, user.PasswordHash):
+        if not user:
+            flash('Invalid Employee ID or password.', 'error')
+            return render_template('login.html')
+        
+        # Check if account is locked
+        if user.AccountLockedUntil:
+            locked_until = user.AccountLockedUntil
+            # Make timezone-aware if naive
+            if locked_until.tzinfo is None:
+                locked_until = locked_until.replace(tzinfo=IST)
+            if locked_until > datetime.now(IST):
+                remaining = (locked_until - datetime.now(IST)).seconds // 60
+                flash(f'Account locked due to multiple failed login attempts. Try again in {remaining} minutes.', 'error')
+                return render_template('login.html')
+            else:
+                # Reset lock if time has passed
+                user.AccountLockedUntil = None
+                user.FailedLoginAttempts = 0
+                db.session.commit()
+        
+        # Check if account is active
+        if not user.IsActive:
+            flash('Your account is inactive. Please contact administrator.', 'error')
+            return render_template('login.html')
+        
+        # Check password expiry
+        if user.PasswordExpiryDate:
+            expiry_date = user.PasswordExpiryDate
+            # Make timezone-aware if naive
+            if expiry_date.tzinfo is None:
+                expiry_date = expiry_date.replace(tzinfo=IST)
+            if expiry_date < datetime.now(IST):
+                flash('Your password has expired. Please contact administrator to reset it.', 'error')
+                return render_template('login.html')
+        
+        # Verify password
+        if verify_password(password, user.PasswordHash):
+            # Reset failed attempts on successful login
+            user.FailedLoginAttempts = 0
+            user.LastFailedLogin = None
+            db.session.commit()
+            
             session['user_id'] = user.UserID
             flash('Login successful!', 'success')
             return redirect(url_for('dashboard'))
         else:
-            flash('Invalid credentials or inactive account.', 'error')
+            # Increment failed attempts
+            user.FailedLoginAttempts += 1
+            user.LastFailedLogin = datetime.now(IST)
+            
+            # Lock account after 5 failed attempts
+            if user.FailedLoginAttempts >= 5:
+                user.AccountLockedUntil = datetime.now(IST) + timedelta(minutes=30)
+                db.session.commit()
+                flash('Account locked due to 5 failed login attempts. Try again in 30 minutes.', 'error')
+            else:
+                db.session.commit()
+                remaining_attempts = 5 - user.FailedLoginAttempts
+                flash(f'Invalid password. {remaining_attempts} attempt(s) remaining before account lockout.', 'error')
     
     return render_template('login.html')
+
+@app.route('/change-password', methods=['POST'])
+@login_required
+def change_password():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    current_password = request.form.get('current_password')
+    new_password = request.form.get('new_password')
+    confirm_password = request.form.get('confirm_password')
+    
+    # Validate current password
+    if not verify_password(current_password, user.PasswordHash):
+        flash('Current password is incorrect.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Validate new password
+    if not new_password or len(new_password) < 6:
+        flash('New password must be at least 6 characters long.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Validate password confirmation
+    if new_password != confirm_password:
+        flash('New password and confirm password do not match.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Update password
+    user.PasswordHash = hash_password(new_password)
+    user.PasswordLastChanged = datetime.now(IST)
+    user.PasswordExpiryDate = datetime.now(IST) + timedelta(days=90)
+    db.session.commit()
+    
+    flash('Password changed successfully! Your new password will expire in 90 days.', 'success')
+    return redirect(url_for('dashboard'))
 
 @app.route('/logout')
 def logout():
@@ -200,21 +353,65 @@ def dashboard():
     # Get recent uploads based on role
     if user.role.RoleName == 'Admin':
         recent_uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).limit(5).all()
+    elif user.role.RoleName == 'Management':
+        recent_uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).limit(5).all()
     elif user.role.RoleName == 'HOD':
         recent_uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).limit(5).all()
     else:
-        recent_uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).limit(5).all()
+        flash('Invalid role. Please contact administrator.', 'error')
+        session.clear()
+        return redirect(url_for('login'))
+    
+    # Check upload window status
+    upload_allowed, upload_message = check_upload_window()
+    
+    # Get HOD count and pending uploads for admin and management
+    hod_count = 0
+    pending_uploads_count = 0
+    if user.role.RoleName == 'Admin':
+        hod_role = Role.query.filter_by(RoleName='HOD').first()
+        if hod_role:
+            hod_count = User.query.filter_by(RoleID=hod_role.RoleID, IsActive=True).count()
+    if user.role.RoleName == 'Management':
+        pending_uploads_count = MISUpload.query.filter_by(Status='In Review').count()
     
     stats = {
         'total_users': User.query.count(),
         'total_depts': Department.query.count(),
         'active_fy': active_fy.FYName if active_fy else 'None',
         'total_uploads': MISUpload.query.count(),
-        'recent_uploads': recent_uploads
+        'recent_uploads': recent_uploads,
+        'upload_allowed': upload_allowed,
+        'upload_message': upload_message,
+        'hod_count': hod_count,
+        'pending_uploads_count': pending_uploads_count,
+        'email_configured': email_service.is_configured()
     }
     
-    return render_template('dashboard.html', current_user=user, stats=stats)
+    return render_template('dashboard.html', current_user=user, stats=stats, 
+                          upload_window_start=UPLOAD_WINDOW_START_DAY, 
+                          upload_window_end=UPLOAD_WINDOW_END_DAY)
 
+
+@app.route('/my-uploads')
+@login_required
+def my_uploads():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # HOD can only see their department's uploads
+    if user.role.RoleName == 'HOD':
+        uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).all()
+    else:
+        # If not HOD, redirect to reports page
+        return redirect(url_for('reports'))
+    
+    return render_template('my_uploads.html', 
+                         current_user=user,
+                         uploads=uploads)
 
 @app.route('/reports')
 @login_required
@@ -227,9 +424,33 @@ def reports():
     
     # Filter uploads based on role
     if user.role.RoleName == 'Admin':
-        uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
+        query = MISUpload.query
+    elif user.role.RoleName == 'Management':
+        query = MISUpload.query
     else:
-        uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).all()
+        query = MISUpload.query.filter_by(DepartmentID=user.DepartmentID)
+    
+    # Apply filter parameters
+    department_id = request.args.get('department', '')
+    fy_id = request.args.get('fy', '')
+    status = request.args.get('status', '')
+    search_code = request.args.get('search_code', '').strip()
+    
+    # Search by MIS code if provided
+    if search_code:
+        query = query.filter_by(UploadCode=search_code)
+    else:
+        # Apply other filters only if search_code is not provided
+        if department_id:
+            query = query.filter_by(DepartmentID=int(department_id))
+        
+        if fy_id:
+            query = query.filter_by(FYID=int(fy_id))
+        
+        if status:
+            query = query.filter_by(Status=status)
+    
+    uploads = query.order_by(MISUpload.UploadDate.desc()).all()
     
     departments = Department.query.filter_by(ActiveFlag=True).all()
     financial_years = FinancialYear.query.all()
@@ -238,10 +459,15 @@ def reports():
                          current_user=user,
                          uploads=uploads,
                          departments=departments,
-                         financial_years=financial_years)
+                         financial_years=financial_years,
+                         selected_department=department_id,
+                         selected_fy=fy_id,
+                         selected_status=status,
+                         search_code=search_code,
+                         user_role=user.role.RoleName)
 
 @app.route('/approval-queue')
-@hod_required
+@management_required
 def approval_queue():
     user = User.query.get(session['user_id'])
     if not user or not user.IsActive:
@@ -249,46 +475,232 @@ def approval_queue():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    # Get pending uploads based on role
-    if user.role.RoleName == 'Admin':
-        pending_uploads = MISUpload.query.filter(MISUpload.Status.in_(['Pending', 'Validated'])).order_by(MISUpload.UploadDate.desc()).all()
-    else:
-        pending_uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).filter(MISUpload.Status.in_(['Pending', 'Validated'])).order_by(MISUpload.UploadDate.desc()).all()
+    # Management role - get all uploads pending review from all departments
+    pending_uploads = MISUpload.query.filter_by(Status='In Review').order_by(MISUpload.UploadDate.desc()).all()
     
     return render_template('approval_queue.html', 
                          current_user=user,
                          pending_uploads=pending_uploads)
 
-@app.route('/approve-upload/<int:upload_id>', methods=['POST'])
-@hod_required
-def approve_upload(upload_id):
+@app.route('/view-upload/<int:upload_id>')
+@login_required
+def view_upload(upload_id):
     user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
     upload = MISUpload.query.get_or_404(upload_id)
     
-    # Check permissions
-    if user.role.RoleName == 'HOD' and upload.DepartmentID != user.DepartmentID:
-        flash('You can only approve uploads from your department.', 'error')
-        return redirect(url_for('approval_queue'))
+    # Check permissions: Admin, Management, and HOD can view uploads
+    if user.role.RoleName == 'Management':
+        pass  # Management can view all uploads
+    elif user.role.RoleName == 'Admin':
+        pass  # Admin can view all uploads
+    elif user.role.RoleName == 'HOD' and upload.DepartmentID != user.DepartmentID:
+        flash('Access denied. You can only view uploads from your department.', 'error')
+        return redirect(url_for('reports'))
+    else:
+        flash('Access denied.', 'error')
+        return redirect(url_for('reports'))
+    
+    return render_template('view_upload.html', 
+                         current_user=user,
+                         upload=upload)
+
+@app.route('/approve-upload/<int:upload_id>', methods=['POST'])
+@management_required
+def approve_upload(upload_id):
+    user = User.query.get(session['user_id'])
+    
+    upload = MISUpload.query.get_or_404(upload_id)
     
     upload.Status = 'Approved'
     db.session.commit()
-    flash(f'Upload approved successfully!', 'success')
+    
+    # Send email notification to uploader
+    if email_service.is_configured():
+        uploader = upload.uploader
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        month_name = month_names[upload.MonthID]
+        
+        subject = f"MIS Upload Approved - {upload.department.DeptName} - {month_name} {upload.financial_year.FYName}"
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background-color: #10b981; color: white; padding: 20px; border-radius: 5px 5px 0 0; }}
+                .content {{ background-color: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; }}
+                .success-box {{ background-color: #d1fae5; border-left: 4px solid #10b981; padding: 15px; margin: 20px 0; }}
+                .footer {{ background-color: #f3f4f6; padding: 15px; text-align: center; border-radius: 0 0 5px 5px; font-size: 12px; color: #6b7280; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2 style="margin: 0;">✓ MIS Upload Approved</h2>
+                </div>
+                <div class="content">
+                    <p>Dear {uploader.Username},</p>
+                    
+                    <div class="success-box">
+                        <strong>Great news!</strong> Your MIS upload has been approved by the administrator.
+                    </div>
+                    
+                    <h3>Upload Details:</h3>
+                    <ul>
+                        <li><strong>Department:</strong> {upload.department.DeptName}</li>
+                        <li><strong>Month:</strong> {month_name}</li>
+                        <li><strong>Financial Year:</strong> {upload.financial_year.FYName}</li>
+                        <li><strong>Upload Date:</strong> {upload.UploadDate.strftime('%d %b %Y %H:%M')}</li>
+                        <li><strong>Approved:</strong> {datetime.now(IST).strftime('%d %b %Y %H:%M:%S IST')}</li>
+                        <li><strong>Status:</strong> Approved</li>
+                    </ul>
+                    
+                    <p>Thank you for your timely submission!</p>
+                    
+                    <p>Best regards,<br>
+                    <strong>MIS System Team</strong></p>
+                </div>
+                <div class="footer">
+                    This is an automated notification from the MIS Upload System.
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_content = f"""
+MIS Upload Approved
+
+Dear {uploader.Username},
+
+✓ Great news! Your MIS upload has been approved by the administrator.
+
+Upload Details:
+- Department: {upload.department.DeptName}
+- Month: {month_name}
+- Financial Year: {upload.financial_year.FYName}
+- Upload Date: {upload.UploadDate.strftime('%d %b %Y %H:%M')}
+- Approved: {datetime.now(IST).strftime('%d %b %Y %H:%M:%S IST')}
+- Status: Approved
+
+Thank you for your timely submission!
+
+Best regards,
+MIS System Team
+
+---
+This is an automated notification from the MIS Upload System.
+        """
+        
+        email_service.send_email(uploader.Email, subject, html_content, text_content)
+    
+    flash(f'Upload approved successfully! Notification sent to {upload.uploader.Username}.', 'success')
     return redirect(url_for('approval_queue'))
 
 @app.route('/reject-upload/<int:upload_id>', methods=['POST'])
-@hod_required
+@management_required
 def reject_upload(upload_id):
     user = User.query.get(session['user_id'])
-    upload = MISUpload.query.get_or_404(upload_id)
     
-    # Check permissions
-    if user.role.RoleName == 'HOD' and upload.DepartmentID != user.DepartmentID:
-        flash('You can only reject uploads from your department.', 'error')
-        return redirect(url_for('approval_queue'))
+    upload = MISUpload.query.get_or_404(upload_id)
     
     upload.Status = 'Rejected'
     db.session.commit()
-    flash(f'Upload rejected.', 'warning')
+    
+    # Send email notification to uploader
+    if email_service.is_configured():
+        uploader = upload.uploader
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        month_name = month_names[upload.MonthID]
+        
+        subject = f"MIS Upload Rejected - {upload.department.DeptName} - {month_name} {upload.financial_year.FYName}"
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background-color: #ef4444; color: white; padding: 20px; border-radius: 5px 5px 0 0; }}
+                .content {{ background-color: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; }}
+                .warning-box {{ background-color: #fee2e2; border-left: 4px solid #ef4444; padding: 15px; margin: 20px 0; }}
+                .footer {{ background-color: #f3f4f6; padding: 15px; text-align: center; border-radius: 0 0 5px 5px; font-size: 12px; color: #6b7280; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h2 style="margin: 0;">✗ MIS Upload Rejected</h2>
+                </div>
+                <div class="content">
+                    <p>Dear {uploader.Username},</p>
+                    
+                    <div class="warning-box">
+                        <strong>Action Required:</strong> Your MIS upload has been rejected by the administrator.
+                    </div>
+                    
+                    <h3>Upload Details:</h3>
+                    <ul>
+                        <li><strong>Department:</strong> {upload.department.DeptName}</li>
+                        <li><strong>Month:</strong> {month_name}</li>
+                        <li><strong>Financial Year:</strong> {upload.financial_year.FYName}</li>
+                        <li><strong>Upload Date:</strong> {upload.UploadDate.strftime('%d %b %Y %H:%M')}</li>
+                        <li><strong>Rejected:</strong> {datetime.now(IST).strftime('%d %b %Y %H:%M:%S IST')}</li>
+                        <li><strong>Status:</strong> Rejected</li>
+                    </ul>
+                    
+                    <p>Please review your submission and re-upload the corrected data during the upload window ({UPLOAD_WINDOW_START_DAY}st-{UPLOAD_WINDOW_END_DAY}th of each month).</p>
+                    
+                    <p>If you have any questions, please contact the administrator.</p>
+                    
+                    <p>Best regards,<br>
+                    <strong>MIS System Team</strong></p>
+                </div>
+                <div class="footer">
+                    This is an automated notification from the MIS Upload System.
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_content = f"""
+MIS Upload Rejected
+
+Dear {uploader.Username},
+
+✗ Action Required: Your MIS upload has been rejected by the administrator.
+
+Upload Details:
+- Department: {upload.department.DeptName}
+- Month: {month_name}
+- Financial Year: {upload.financial_year.FYName}
+- Upload Date: {upload.UploadDate.strftime('%d %b %Y %H:%M')}
+- Rejected: {datetime.now(IST).strftime('%d %b %Y %H:%M:%S IST')}
+- Status: Rejected
+
+Please review your submission and re-upload the corrected data during the upload window ({UPLOAD_WINDOW_START_DAY}st-{UPLOAD_WINDOW_END_DAY}th of each month).
+
+If you have any questions, please contact the administrator.
+
+Best regards,
+MIS System Team
+
+---
+This is an automated notification from the MIS Upload System.
+        """
+        
+        email_service.send_email(uploader.Email, subject, html_content, text_content)
+    
+    flash(f'Upload rejected. Notification sent to {upload.uploader.Username}.', 'warning')
     return redirect(url_for('approval_queue'))
 
 @app.route('/download-upload/<int:upload_id>')
@@ -315,6 +727,11 @@ def download_upload(upload_id):
 def delete_upload(upload_id):
     user = User.query.get(session['user_id'])
     upload = MISUpload.query.get_or_404(upload_id)
+    
+    # Can only delete uploads with "In Review" status
+    if upload.Status != 'In Review':
+        flash(f'Cannot delete uploads with status "{upload.Status}". Only "In Review" uploads can be deleted.', 'error')
+        return redirect(url_for('reports'))
     
     # HOD can only delete from their department
     if user.role.RoleName == 'HOD' and upload.DepartmentID != user.DepartmentID:
@@ -552,6 +969,143 @@ def delete_fy(fy_id):
     
     return redirect(url_for('config_master'))
 
+@app.route('/send-test-email', methods=['POST'])
+@admin_required
+def send_test_email():
+    """Send a test email to verify email configuration"""
+    user = User.query.get(session['user_id'])
+    
+    if not email_service.is_configured():
+        flash('Email service is not configured. Please set up SMTP credentials in email_config.py.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Send test email to the admin user
+    subject = "Test Email - MIS System"
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #4F46E5; color: white; padding: 20px; border-radius: 5px 5px 0 0; }}
+            .content {{ background-color: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; }}
+            .footer {{ background-color: #f3f4f6; padding: 15px; text-align: center; border-radius: 0 0 5px 5px; font-size: 12px; color: #6b7280; }}
+            .success-box {{ background-color: #d1fae5; border-left: 4px solid #10b981; padding: 15px; margin: 20px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h2 style="margin: 0;">✓ Email Test Successful</h2>
+            </div>
+            <div class="content">
+                <div class="success-box">
+                    <strong>Congratulations!</strong> Your email configuration is working correctly.
+                </div>
+                
+                <p>Dear {user.Username},</p>
+                
+                <p>This is a test email from the MIS Configuration System to verify that your SMTP settings are configured correctly.</p>
+                
+                <h3>Configuration Details:</h3>
+                <ul>
+                    <li><strong>SMTP Host:</strong> {email_service.smtp_host}</li>
+                    <li><strong>SMTP Port:</strong> {email_service.smtp_port}</li>
+                    <li><strong>From Email:</strong> {email_service.from_email}</li>
+                    <li><strong>Sent to:</strong> {user.Email}</li>
+                    <li><strong>Timestamp:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</li>
+                </ul>
+                
+                <p>If you received this email, your email notification system is ready to use!</p>
+                
+                <p>Best regards,<br>
+                <strong>MIS System</strong></p>
+            </div>
+            <div class="footer">
+                This is a test email from the MIS Upload System.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text_content = f"""
+Test Email - MIS System
+
+✓ Email Configuration Test Successful
+
+Dear {user.Username},
+
+This is a test email from the MIS Configuration System to verify that your SMTP settings are configured correctly.
+
+Configuration Details:
+- SMTP Host: {email_service.smtp_host}
+- SMTP Port: {email_service.smtp_port}
+- From Email: {email_service.from_email}
+- Sent to: {user.Email}
+- Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+If you received this email, your email notification system is ready to use!
+
+Best regards,
+MIS System
+    """
+    
+    success, message = email_service.send_email(user.Email, subject, html_content, text_content)
+    
+    if success:
+        flash(f'✓ Test email sent successfully to {user.Email}! Check your inbox.', 'success')
+    else:
+        flash(f'✗ Failed to send test email: {message}', 'error')
+    
+    return redirect(url_for('dashboard'))
+
+@app.route('/send-upload-notifications', methods=['POST'])
+@admin_required
+def send_upload_notifications():
+    """Send email notifications to all HOD users about MIS upload window"""
+    hod_role = Role.query.filter_by(RoleName='HOD').first()
+    
+    if not hod_role:
+        flash('HOD role not found in the system.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    hod_users = User.query.filter_by(RoleID=hod_role.RoleID, IsActive=True).all()
+    
+    if not hod_users:
+        flash('No active HOD users found to notify.', 'warning')
+        return redirect(url_for('dashboard'))
+    
+    if not email_service.is_configured():
+        flash('Email service is not configured. Please set up SMTP credentials in environment variables.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    # Get application URL from environment or request
+    app_url = os.environ.get('REPLIT_DEV_DOMAIN')
+    if app_url:
+        app_url = f'https://{app_url}'
+    else:
+        app_url = request.host_url.rstrip('/')
+    
+    success_count, total_count, messages = email_service.send_upload_window_notification(hod_users, app_url)
+    
+    # Show detailed results
+    if success_count == total_count:
+        flash(f'✓ Successfully sent notifications to all {total_count} HOD users!', 'success')
+    elif success_count > 0:
+        flash(f'⚠ Partially successful: Sent {success_count} out of {total_count} notifications.', 'warning')
+    else:
+        flash(f'✗ Failed to send any notifications. Please check email configuration.', 'error')
+    
+    # Show individual failures
+    for msg in messages:
+        if 'Failed' in msg or 'error' in msg.lower() or 'Authentication' in msg:
+            flash(f'❌ {msg}', 'error')
+    
+    return redirect(url_for('dashboard'))
+
 @app.route('/user-management')
 @admin_required
 def user_management():
@@ -559,37 +1113,45 @@ def user_management():
     users = User.query.all()
     departments = Department.query.all()
     roles = Role.query.all()
+    email_configured = email_service.is_configured()
     
     return render_template('user_management.html',
                                  current_user=user,
                                  users=users,
                                  departments=departments,
-                                 roles=roles)
+                                 roles=roles,
+                                 email_configured=email_configured)
 
 @app.route('/add-user', methods=['POST'])
 @admin_required
 def add_user():
+    emp_id = request.form.get('emp_id')
     username = request.form.get('username')
     email = request.form.get('email')
     password = request.form.get('password')
     department_id = request.form.get('department_id')
     role_id = request.form.get('role_id')
     
-    if not username or not email or not password or not department_id or not role_id:
-        flash('All fields are required.', 'error')
-    elif User.query.filter_by(Username=username).first():
-        flash('Username already exists.', 'error')
+    if not emp_id or not email or not password or not department_id or not role_id:
+        flash('Employee ID, Email, Password, Department and Role are required fields.', 'error')
+    
+    elif User.query.filter_by(EmpID=emp_id).first():
+        flash('Employee ID already exists.', 'error')
     elif User.query.filter_by(Email=email).first():
         flash('Email already exists.', 'error')
     else:
         hashed_password = hash_password(password)
         new_user = User(  # type: ignore
-            Username=username,
+            EmpID=emp_id,
+            Username=username if username else None,
             Email=email,
             PasswordHash=hashed_password,
             DepartmentID=department_id,
             RoleID=role_id,
-            IsActive=True
+            IsActive=True,
+            FailedLoginAttempts=0,
+            PasswordLastChanged=datetime.now(IST),
+            PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
         )
         db.session.add(new_user)
         db.session.commit()
@@ -601,27 +1163,33 @@ def add_user():
 @admin_required
 def edit_user(user_id):
     user = User.query.get_or_404(user_id)
+    emp_id = request.form.get('emp_id')
     username = request.form.get('username')
     email = request.form.get('email')
     department_id = request.form.get('department_id')
     role_id = request.form.get('role_id')
     password = request.form.get('password')
     
-    if not username or not email or not department_id or not role_id:
-        flash('All fields are required.', 'error')
+    if not emp_id or not email or not department_id or not role_id:
+        flash('Employee ID, Email, Department and Role are required fields.', 'error')
         return redirect(url_for('user_management'))
     
-    if username != user.Username and User.query.filter_by(Username=username).first():
-        flash('Username already exists.', 'error')
+    if not email.lower().endswith('@gmail.com'):
+        flash('Only Gmail addresses are allowed. Please use an email ending with @gmail.com', 'error')
+    elif emp_id != user.EmpID and User.query.filter_by(EmpID=emp_id).first():
+        flash('Employee ID already exists.', 'error')
     elif email != user.Email and User.query.filter_by(Email=email).first():
         flash('Email already exists.', 'error')
     else:
-        user.Username = username
+        user.EmpID = emp_id
+        user.Username = username if username else None
         user.Email = email
         user.DepartmentID = department_id
         user.RoleID = role_id
         if password:
             user.PasswordHash = hash_password(password)
+            user.PasswordLastChanged = datetime.now(IST)
+            user.PasswordExpiryDate = datetime.now(IST) + timedelta(days=90)
         db.session.commit()
         flash('User updated successfully!', 'success')
     
@@ -633,7 +1201,7 @@ def toggle_user(user_id):
     user = User.query.get_or_404(user_id)
     user.IsActive = not user.IsActive
     db.session.commit()
-    flash(f'User {user.Username} {"activated" if user.IsActive else "deactivated"}.', 'success')
+    flash(f'User {user.EmpID} {"activated" if user.IsActive else "deactivated"}.', 'success')
     return redirect(url_for('user_management'))
 
 @app.route('/delete-user/<int:user_id>', methods=['POST'])
@@ -659,13 +1227,19 @@ def mis_upload():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    upload_allowed, upload_message = check_upload_window()
-    
+    # Admin and HOD can upload during window, Management cannot upload
     if user.role.RoleName == 'Admin':
+        upload_allowed, upload_message = check_upload_window()
+        departments = Department.query.all()
+        uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
+    elif user.role.RoleName == 'Management':
+        upload_allowed = False
+        upload_message = "Management role cannot upload MIS. Please use the Approval Queue to review and approve uploads."
         departments = Department.query.all()
         uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
     else:
-        # HOD and User can only see their department
+        upload_allowed, upload_message = check_upload_window()
+        # HOD can only see their department
         departments = Department.query.filter_by(DeptID=user.DepartmentID).all()
         uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).all()
     
@@ -678,6 +1252,8 @@ def mis_upload():
                                  current_date=date.today().strftime('%Y-%m-%d'),
                                  departments=departments,
                                  financial_years=financial_years,
+                                 upload_window_start=UPLOAD_WINDOW_START_DAY,
+                                 upload_window_end=UPLOAD_WINDOW_END_DAY,
                                  uploads=uploads)
 
 @app.route('/upload-mis', methods=['POST'])
@@ -689,11 +1265,17 @@ def upload_mis():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    upload_allowed, upload_message = check_upload_window()
-    
-    if not upload_allowed:
-        flash(upload_message, 'error')
+    # Management cannot upload
+    if user.role.RoleName == 'Management':
+        flash('Management role cannot upload MIS files.', 'error')
         return redirect(url_for('mis_upload'))
+    
+    # HOD must follow upload window, but Admin can upload anytime
+    if user.role.RoleName != 'Admin':
+        upload_allowed, upload_message = check_upload_window()
+        if not upload_allowed:
+            flash(upload_message, 'error')
+            return redirect(url_for('mis_upload'))
     
     if 'file' not in request.files:
         flash('No file selected.', 'error')
@@ -717,13 +1299,33 @@ def upload_mis():
         flash('All fields are required.', 'error')
         return redirect(url_for('mis_upload'))
     
-    # HOD and User can only upload for their own department
-    if user.role.RoleName in ['HOD', 'User'] and int(department_id) != user.DepartmentID:
+    # HOD users can only upload for current month
+    if user.role.RoleName == 'HOD':
+        current_month = date.today().month
+        if int(month_id) != current_month:
+            flash(f'HOD users can only upload MIS data for the current month (Month {current_month}). Old month uploads are not allowed.', 'error')
+            return redirect(url_for('mis_upload'))
+    
+    # HOD can only upload for their own department
+    if user.role.RoleName == 'HOD' and int(department_id) != user.DepartmentID:
         flash('You can only upload for your own department.', 'error')
         return redirect(url_for('mis_upload'))
     
-    filename = secure_filename(f"{department_id}_{month_id}_{fy_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}")
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    # Get FY and Department names for organized storage
+    fy = FinancialYear.query.get(fy_id)
+    dept = Department.query.get(department_id)
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    
+    # Create organized directory structure: /MISUploads/[FY]/[Department]/[Month]/
+    upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], fy.FYName, dept.DeptName, month_names[int(month_id)])
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # Allow multiple uploads for the same month - Management will review all of them
+    # No automatic archiving - all uploads with same month stay "In Review" for Management decision
+    
+    # Save new file
+    filename = secure_filename(f"{dept.DeptName}_{month_names[int(month_id)]}_{fy.FYName}_{file.filename}")
+    filepath = os.path.join(upload_dir, filename)
     file.save(filepath)
     
     # Validate Excel file content
@@ -734,18 +1336,26 @@ def upload_mis():
         flash(f'Validation Error: {validation_message}', 'error')
         return redirect(url_for('mis_upload'))
     
+    # Admin uploads are auto-approved, others go to review queue for Management approval
+    upload_status = 'Approved' if user.role.RoleName == 'Admin' else 'In Review'
+    
+    # Generate unique MIS code
+    mis_code = generate_mis_code(int(department_id))
+    
     upload = MISUpload(  # type: ignore
+        UploadCode=mis_code,
         DepartmentID=department_id,
         MonthID=month_id,
         FYID=fy_id,
         UploadedBy=session['user_id'],
         FilePath=filepath,
-        Status='Validated'
+        FileCheck='Validated',
+        Status=upload_status
     )
     db.session.add(upload)
     db.session.commit()
     
-    flash(f'✓ Validation Success: {validation_message} File uploaded successfully!', 'success')
+    flash(f'✓ File Validation Success: {validation_message} File uploaded successfully and is now pending Management review.', 'success')
     return redirect(url_for('mis_upload'))
 
 @app.route('/template-management')
@@ -819,6 +1429,60 @@ def upload_template():
     flash('Template uploaded successfully!', 'success')
     return redirect(url_for('template_management'))
 
+@app.route('/edit-template/<int:template_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_template(template_id):
+    template = Template.query.get_or_404(template_id)
+    user = User.query.get(session['user_id'])
+    departments = Department.query.all()
+    
+    if request.method == 'POST':
+        file = request.files.get('file')
+        department_id = request.form.get('department_id')
+        
+        if not department_id:
+            flash('Department is required.', 'error')
+            return render_template('edit_template.html', template=template, departments=departments, current_user=user)
+        
+        # If new file provided, replace the old one
+        if file and file.filename:
+            if not (file.filename.endswith('.xls') or file.filename.endswith('.xlsx')):
+                flash('Only .xls or .xlsx files are allowed.', 'error')
+                return render_template('edit_template.html', template=template, departments=departments, current_user=user)
+            
+            # Delete old file
+            if os.path.exists(template.FilePath):
+                os.remove(template.FilePath)
+            
+            # Save new file
+            filename = secure_filename(f"template_{department_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}")
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            template.FilePath = filepath
+            template.UploadDate = datetime.now(IST)
+        
+        template.DepartmentID = department_id
+        db.session.commit()
+        flash('Template updated successfully!', 'success')
+        return redirect(url_for('template_management'))
+    
+    return render_template('edit_template.html', template=template, departments=departments, current_user=user)
+
+@app.route('/delete-template/<int:template_id>', methods=['POST'])
+@admin_required
+def delete_template(template_id):
+    template = Template.query.get_or_404(template_id)
+    
+    # Delete file from storage
+    if os.path.exists(template.FilePath):
+        os.remove(template.FilePath)
+    
+    db.session.delete(template)
+    db.session.commit()
+    
+    flash('Template deleted successfully!', 'success')
+    return redirect(url_for('template_management'))
+
 def init_db():
     with app.app_context():
         db.create_all()
@@ -826,8 +1490,8 @@ def init_db():
         if Role.query.count() == 0:
             roles = [
                 Role(RoleName='Admin'),  # type: ignore
-                Role(RoleName='HOD'),  # type: ignore
-                Role(RoleName='User')  # type: ignore
+                Role(RoleName='Management'),  # type: ignore
+                Role(RoleName='HOD')  # type: ignore
             ]
             db.session.add_all(roles)
             db.session.commit()
@@ -862,49 +1526,236 @@ def init_db():
         
         if User.query.count() == 0:
             admin_role = Role.query.filter_by(RoleName='Admin').first()
+            management_role = Role.query.filter_by(RoleName='Management').first()
             hod_role = Role.query.filter_by(RoleName='HOD').first()
-            user_role = Role.query.filter_by(RoleName='User').first()
             
             finance_dept = Department.query.filter_by(DeptName='Finance').first()
             hr_dept = Department.query.filter_by(DeptName='HR').first()
             it_dept = Department.query.filter_by(DeptName='IT').first()
             
-            if admin_role and hod_role and user_role and finance_dept and hr_dept and it_dept:
+            if admin_role and management_role and hod_role and finance_dept and hr_dept and it_dept:
                 users = [
                     User(  # type: ignore
-                        Username='admin',
-                        Email='admin@example.com',
+                        EmpID='EMP001',
+                        Username='Admin User',
+                        Email='admin@gmail.com',
                         PasswordHash=hash_password('admin123'),
                         DepartmentID=it_dept.DeptID,
                         RoleID=admin_role.RoleID,
-                        IsActive=True
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
                     ),
                     User(  # type: ignore
-                        Username='hod',
-                        Email='hod@example.com',
+                        EmpID='EMP005',
+                        Username='Management Approver',
+                        Email='management@gmail.com',
+                        PasswordHash=hash_password('manager123'),
+                        DepartmentID=finance_dept.DeptID,
+                        RoleID=management_role.RoleID,
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
+                    ),
+                    User(  # type: ignore
+                        EmpID='EMP002',
+                        Username='HOD Finance',
+                        Email='hod.finance@gmail.com',
                         PasswordHash=hash_password('hod123'),
                         DepartmentID=finance_dept.DeptID,
                         RoleID=hod_role.RoleID,
-                        IsActive=True
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
                     ),
                     User(  # type: ignore
-                        Username='user',
-                        Email='user@example.com',
-                        PasswordHash=hash_password('user123'),
+                        EmpID='EMP003',
+                        Username='HOD HR',
+                        Email='hod.hr@gmail.com',
+                        PasswordHash=hash_password('hod123'),
                         DepartmentID=hr_dept.DeptID,
-                        RoleID=user_role.RoleID,
-                        IsActive=True
+                        RoleID=hod_role.RoleID,
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
+                    ),
+                    User(  # type: ignore
+                        EmpID='EMP004',
+                        Username='HOD IT',
+                        Email='hod.it@gmail.com',
+                        PasswordHash=hash_password('hod123'),
+                        DepartmentID=it_dept.DeptID,
+                        RoleID=hod_role.RoleID,
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
                     )
                 ]
                 db.session.add_all(users)
                 db.session.commit()
                 print("✓ Test users created:")
-                print("  - Admin: username='admin', password='admin123'")
-                print("  - HOD: username='hod', password='hod123'")
-                print("  - User: username='user', password='user123'")
+                print("  - Admin: emp_id='EMP001', password='admin123' (IT Dept)")
+                print("  - Management: emp_id='EMP005', password='manager123' (Approver)")
+                print("  - HOD Finance: emp_id='EMP002', password='hod123'")
+                print("  - HOD HR: emp_id='EMP003', password='hod123'")
+                print("  - HOD IT: emp_id='EMP004', password='hod123'")
         
         print("Database initialized successfully!")
 
+def send_monthly_notifications():
+    """Automated job to send MIS upload window notifications on the {UPLOAD_WINDOW_START_DAY}st of each month"""
+    try:
+        with app.app_context():
+            hod_role = Role.query.filter_by(RoleName='HOD').first()
+            
+            if not hod_role:
+                logging.error("HOD role not found in database for monthly notification")
+                return
+            
+            hod_users = User.query.filter_by(RoleID=hod_role.RoleID, IsActive=True).all()
+            
+            if not hod_users:
+                logging.warning("No active HOD users found to notify")
+                return
+            
+            if not email_service.is_configured():
+                logging.warning("Email service not configured. Skipping monthly notification.")
+                return
+            
+            # Get app URL from environment
+            app_url = os.environ.get('REPLIT_DEV_DOMAIN', 'https://your-app.replit.dev')
+            if not app_url.startswith('http'):
+                app_url = f'https://{app_url}'
+            
+            success_count, total_count, messages = email_service.send_upload_window_notification(hod_users, app_url)
+            
+            logging.info(f"Monthly notification sent: {success_count}/{total_count} successful")
+            
+            for msg in messages:
+                if 'error' in msg.lower() or 'failed' in msg.lower():
+                    logging.error(f"Notification error: {msg}")
+                else:
+                    logging.info(f"Notification: {msg}")
+    
+    except Exception as e:
+        logging.error(f"Error in monthly notification job: {str(e)}")
+
+def send_25th_reminder():
+    """Send reminder on configured reminder day - final day to upload"""
+    try:
+        with app.app_context():
+            hod_role = Role.query.filter_by(RoleName='HOD').first()
+            if not hod_role or not email_service.is_configured():
+                return
+            
+            hod_users = User.query.filter_by(RoleID=hod_role.RoleID, IsActive=True).all()
+            
+            for user in hod_users:
+                subject = f"⚠️ Final Day to Upload MIS - Upload Window Closes on {UPLOAD_WINDOW_REMINDER_DAY}th"
+                html_content = f"""
+                <!DOCTYPE html>
+                <html>
+                <body style="font-family: Arial, sans-serif;">
+                    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                        <div style="background-color: #f59e0b; color: white; padding: 20px; border-radius: 5px 5px 0 0;">
+                            <h2>⚠️ URGENT: Final Day to Upload MIS ({UPLOAD_WINDOW_REMINDER_DAY}th)</h2>
+                        </div>
+                        <div style="background-color: #f9fafb; padding: 30px; border: 1px solid #e5e7eb;">
+                            <p>Dear {user.Username},</p>
+                            <div style="background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 15px; margin: 20px 0;">
+                                <strong>This is the FINAL DAY to upload your MIS report!</strong><br>
+                                The upload window closes at midnight tonight (11:59 PM).
+                            </div>
+                            <p><strong>Department:</strong> {user.department.DeptName}</p>
+                            <p>Please ensure all monthly reports are submitted before the deadline ends on the {UPLOAD_WINDOW_END_DAY}th.</p>
+                            <p>Best regards,<br><strong>MIS System Team</strong></p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+                email_service.send_email(user.Email, subject, html_content)
+            
+            logging.info(f"Reminder sent to {len(hod_users)} HOD users on {UPLOAD_WINDOW_REMINDER_DAY}th")
+    except Exception as e:
+        logging.error(f"Error in reminder: {str(e)}")
+
+def upload_window_lock():
+    """Lock uploads on configured lock day - system auto-disable"""
+    try:
+        with app.app_context():
+            logging.info(f"Upload window locked on {UPLOAD_LOCK_DAY}th. Uploads disabled until {UPLOAD_WINDOW_START_DAY}st of next month.")
+            # Additional logging or system state updates can be added here
+    except Exception as e:
+        logging.error(f"Error in upload lock: {str(e)}")
+
+# Initialize scheduler
+scheduler = None
+
+def setup_scheduler():
+    """Set up automated scheduler for monthly notifications"""
+    global scheduler
+    
+    if scheduler is not None:
+        logging.info("Scheduler already running")
+        return scheduler
+    
+    scheduler = BackgroundScheduler(timezone=IST)
+    
+    # MIS upload window opens
+    scheduler.add_job(
+        send_monthly_notifications,
+        trigger=CronTrigger(day=UPLOAD_WINDOW_START_DAY, hour=UPLOAD_WINDOW_OPEN_HOUR, minute=UPLOAD_WINDOW_OPEN_MINUTE, timezone=IST),
+        id='monthly_mis_notification',
+        name=f'Send MIS upload window open notification ({UPLOAD_WINDOW_START_DAY}st at {UPLOAD_WINDOW_OPEN_HOUR:02d}:{UPLOAD_WINDOW_OPEN_MINUTE:02d})',
+        replace_existing=True
+    )
+    
+    # Final reminder on configured reminder day
+    scheduler.add_job(
+        send_25th_reminder,
+        trigger=CronTrigger(day=UPLOAD_WINDOW_REMINDER_DAY, hour=UPLOAD_WINDOW_REMINDER_HOUR, minute=UPLOAD_WINDOW_REMINDER_MINUTE, timezone=IST),
+        id='upload_reminder',
+        name=f'Send final day reminder ({UPLOAD_WINDOW_REMINDER_DAY}th at {UPLOAD_WINDOW_REMINDER_HOUR:02d}:{UPLOAD_WINDOW_REMINDER_MINUTE:02d})',
+        replace_existing=True
+    )
+    
+    # Upload window lock on configured lock day
+    scheduler.add_job(
+        upload_window_lock,
+        trigger=CronTrigger(day=UPLOAD_LOCK_DAY, hour=UPLOAD_WINDOW_LOCK_HOUR, minute=UPLOAD_WINDOW_LOCK_MINUTE, timezone=IST),
+        id='upload_lock',
+        name=f'Lock upload window ({UPLOAD_LOCK_DAY}th at {UPLOAD_WINDOW_LOCK_HOUR:02d}:{UPLOAD_WINDOW_LOCK_MINUTE:02d})',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    logging.info("✓ Scheduler started with 3 automated events:")
+    logging.info(f"  - {UPLOAD_WINDOW_START_DAY}st at {UPLOAD_WINDOW_OPEN_HOUR:02d}:{UPLOAD_WINDOW_OPEN_MINUTE:02d}: Upload window opens")
+    logging.info(f"  - {UPLOAD_WINDOW_REMINDER_DAY}th at {UPLOAD_WINDOW_REMINDER_HOUR:02d}:{UPLOAD_WINDOW_REMINDER_MINUTE:02d}: Final reminder")
+    logging.info(f"  - {UPLOAD_LOCK_DAY}th at {UPLOAD_WINDOW_LOCK_HOUR:02d}:{UPLOAD_WINDOW_LOCK_MINUTE:02d}: Upload lock")
+    
+    return scheduler
+
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    
+    # Start automated notification scheduler
+    if email_service.is_configured():
+        setup_scheduler()
+        logging.info("Automated email notifications enabled.")
+    else:
+        logging.warning("Email service not configured. Automated notifications disabled. Configure SMTP settings to enable.")
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=True)
+    finally:
+        if scheduler:
+            scheduler.shutdown()
+            logging.info("Scheduler shut down.")

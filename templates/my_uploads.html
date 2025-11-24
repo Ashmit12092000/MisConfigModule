@@ -1,0 +1,103 @@
+
+{% extends "base.html" %}
+
+{% block title %}My Uploads - MIS{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+    <div class="mb-8">
+        <h2 class="text-4xl font-bold text-gray-800 mb-2">
+            <i class="fas fa-file-upload text-blue-600"></i> My Department Uploads
+        </h2>
+        <p class="text-gray-600">View and track all MIS uploads for {{ current_user.department.DeptName }} Department</p>
+    </div>
+    
+    <div class="card p-6">
+        <h3 class="text-2xl font-bold mb-4 flex items-center gap-2">
+            <i class="fas fa-table text-blue-600"></i> Upload History ({{ uploads|length }} uploads)
+        </h3>
+        
+        {% if uploads %}
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead class="bg-gray-100">
+                    <tr>
+                        <th class="px-4 py-3 text-left font-semibold">Month</th>
+                        <th class="px-4 py-3 text-left font-semibold">Financial Year</th>
+                        <th class="px-4 py-3 text-left font-semibold">Upload Date</th>
+                        <th class="px-4 py-3 text-left font-semibold">Uploaded By</th>
+                        <th class="px-4 py-3 text-left font-semibold">File Check</th>
+                        <th class="px-4 py-3 text-left font-semibold">Status</th>
+                        <th class="px-4 py-3 text-left font-semibold">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for upload in uploads %}
+                    <tr class="border-b hover:bg-gray-50">
+                        <td class="px-4 py-3">
+                            <span class="font-medium">{{ ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][upload.MonthID] }}</span>
+                        </td>
+                        <td class="px-4 py-3">{{ upload.financial_year.FYName }}</td>
+                        <td class="px-4 py-3">
+                            <i class="fas fa-calendar mr-1 text-gray-500"></i>
+                            {{ upload.UploadDate.strftime('%d %b %Y') }}
+                            <br>
+                            <span class="text-sm text-gray-500">{{ upload.UploadDate.strftime('%H:%M') }}</span>
+                        </td>
+                        <td class="px-4 py-3">
+                            <i class="fas fa-user mr-1 text-gray-500"></i>
+                            {{ upload.uploader.Username }}
+                        </td>
+                        <td class="px-4 py-3">
+                            <span class="badge {% if upload.FileCheck == 'Validated' %}badge-validated{% else %}badge-rejected{% endif %}">
+                                {% if upload.FileCheck == 'Validated' %}
+                                    <i class="fas fa-check mr-1"></i>
+                                {% else %}
+                                    <i class="fas fa-times mr-1"></i>
+                                {% endif %}
+                                {{ upload.FileCheck }}
+                            </span>
+                        </td>
+                        <td class="px-4 py-3">
+                            <div class="flex items-center gap-2">
+                                <span class="badge {% if upload.Status == 'In Review' %}badge-pending{% elif upload.Status == 'Approved' %}badge-approved{% elif upload.Status == 'Rejected' %}badge-rejected{% endif %}">
+                                    {% if upload.Status == 'In Review' %}
+                                        <i class="fas fa-clock mr-1"></i>
+                                    {% elif upload.Status == 'Approved' %}
+                                        <i class="fas fa-check-circle mr-1"></i>
+                                    {% elif upload.Status == 'Rejected' %}
+                                        <i class="fas fa-times-circle mr-1"></i>
+                                    {% endif %}
+                                    {{ upload.Status }}
+                                </span>
+                                {% if upload.Status == 'Approved' and upload.uploader.role.RoleName == 'Admin' %}
+                                <span class="badge badge-admin-approved" title="Automatically approved by Admin">
+                                    <i class="fas fa-star mr-1"></i> Admin Auto-Approved
+                                </span>
+                                {% endif %}
+                            </div>
+                        </td>
+                        <td class="px-4 py-3">
+                            <a href="{{ url_for('download_upload', upload_id=upload.UploadID) }}" 
+                               class="text-blue-600 hover:text-blue-800 mr-3">
+                                <i class="fas fa-download mr-1"></i> Download
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="text-center py-12 text-gray-500">
+            <i class="fas fa-inbox text-6xl mb-4 text-gray-400"></i>
+            <h3 class="text-2xl font-bold mb-2">No Uploads Yet</h3>
+            <p>Your department hasn't submitted any MIS reports yet.</p>
+            <a href="{{ url_for('mis_upload') }}" class="inline-block mt-4 btn btn-primary">
+                <i class="fas fa-cloud-upload-alt mr-2"></i> Upload First Report
+            </a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
