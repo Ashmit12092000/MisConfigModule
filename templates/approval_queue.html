@@ -35,13 +35,18 @@
                                 </p>
                             </div>
                         </div>
-                        <div class="flex items-center gap-2 mt-2">
+                        <div class="flex items-center gap-2 mt-2 flex-wrap">
                             <span class="badge badge-validated">
                                 <i class="fas fa-check mr-1"></i> File: {{ upload.FileCheck }}
                             </span>
                             <span class="badge badge-pending">
                                 <i class="fas fa-clock mr-1"></i> {{ upload.Status }}
                             </span>
+                            {% if upload.IsModified %}
+                            <span class="badge" style="background-color: #dbeafe; color: #1e40af;">
+                                <i class="fas fa-sync mr-1"></i> Modified
+                            </span>
+                            {% endif %}
                             <a href="{{ url_for('download_upload', upload_id=upload.UploadID) }}" 
                                class="text-sm text-blue-600 hover:text-blue-800">
                                 <i class="fas fa-download mr-1"></i> Download & Review

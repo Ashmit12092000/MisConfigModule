@@ -8,12 +8,21 @@
     <h2 class="text-3xl font-bold mb-6">Monthly MIS Upload</h2>
     
     <div class="bg-white p-6 rounded-lg shadow-md mb-6">
+        {% if hod_blocked_message %}
+        <div class="mb-4 p-4 rounded bg-red-100 text-red-700 border-l-4 border-red-500">
+            <p class="font-bold">
+                <i class="fas fa-lock mr-2"></i>Upload Blocked
+            </p>
+            <p class="mt-2">{{ hod_blocked_message }}</p>
+        </div>
+        {% else %}
         <div class="mb-4 p-4 rounded {% if upload_allowed %}bg-green-100 text-green-700{% else %}bg-yellow-100 text-yellow-700{% endif %}">
             <p class="font-bold">{{ upload_message }}</p>
             <p class="text-sm">Current Date: {{ current_date }}</p>
         </div>
+        {% endif %}
         
-        {% if upload_allowed %}
+        {% if upload_allowed and not hod_blocked_message %}
         <div class="mb-4 p-4 bg-blue-50 rounded border border-blue-200">
             <h4 class="font-bold text-blue-800 mb-2">📥 Download MIS Template</h4>
             <p class="text-sm text-gray-600 mb-2">Download the template for your department before uploading data.</p>
@@ -127,9 +136,15 @@
                             </span>
                         </td>
                         <td class="px-4 py-2">
+                            {% if upload.IsCancelled %}
+                            <span class="px-2 py-1 rounded text-sm bg-red-100 text-red-700">
+                                Cancelled
+                            </span>
+                            {% else %}
                             <span class="px-2 py-1 rounded text-sm {% if upload.Status == 'In Review' %}bg-yellow-100 text-yellow-700{% elif upload.Status == 'Approved' %}bg-blue-100 text-blue-700{% else %}bg-red-100 text-red-700{% endif %}">
                                 {{ upload.Status }}
                             </span>
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}

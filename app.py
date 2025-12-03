@@ -10,12 +10,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import logging
 import pytz
+import calendar
 from config import (
     UPLOAD_WINDOW_START_DAY, UPLOAD_WINDOW_END_DAY,
     UPLOAD_WINDOW_REMINDER_DAY, UPLOAD_LOCK_DAY,
     UPLOAD_WINDOW_OPEN_HOUR, UPLOAD_WINDOW_OPEN_MINUTE,
     UPLOAD_WINDOW_REMINDER_HOUR, UPLOAD_WINDOW_REMINDER_MINUTE,
-    UPLOAD_WINDOW_LOCK_HOUR, UPLOAD_WINDOW_LOCK_MINUTE
+    UPLOAD_WINDOW_LOCK_HOUR, UPLOAD_WINDOW_LOCK_MINUTE,
+    SUPERVISOR_APPROVAL_START_DAY, SUPERVISOR_APPROVAL_HOUR, SUPERVISOR_APPROVAL_MINUTE
 )
 
 # Set IST timezone
@@ -79,7 +81,7 @@ class User(db.Model):
     PasswordExpiryDate = db.Column(db.DateTime, default=lambda: datetime.now(IST) + timedelta(days=90))
     CreatedAt = db.Column(db.DateTime, default=lambda: datetime.now(IST))
     UpdatedAt = db.Column(db.DateTime, default=lambda: datetime.now(IST), onupdate=lambda: datetime.now(IST))
-    uploads = db.relationship('MISUpload', backref='uploader', lazy=True)
+    uploads = db.relationship('MISUpload', foreign_keys='MISUpload.UploadedBy', backref='uploader', lazy=True)
 
 class MISUpload(db.Model):
     __tablename__ = 'mis_uploads'
@@ -93,6 +95,11 @@ class MISUpload(db.Model):
     FilePath = db.Column(db.String(255), nullable=False)
     FileCheck = db.Column(db.String(50), default='Not Validated')
     Status = db.Column(db.String(50), default='In Review')
+    IsModified = db.Column(db.Boolean, default=False)
+    IsCancelled = db.Column(db.Boolean, default=False)
+    SupervisorApproved = db.Column(db.Boolean, default=False)
+    SupervisorApprovedBy = db.Column(db.Integer, db.ForeignKey('users.UserID'), nullable=True)
+    SupervisorApprovedDate = db.Column(db.DateTime, nullable=True)
 
 class Template(db.Model):
     __tablename__ = 'templates'
@@ -100,6 +107,34 @@ class Template(db.Model):
     DepartmentID = db.Column(db.Integer, db.ForeignKey('departments.DeptID'), nullable=False)
     FilePath = db.Column(db.String(255), nullable=False)
     UploadDate = db.Column(db.DateTime, default=lambda: datetime.now(IST))
+
+class ConsolidatedMIS(db.Model):
+    __tablename__ = 'consolidated_mis'
+    ConsolidatedMISID = db.Column(db.Integer, primary_key=True)
+    SupervisorID = db.Column(db.Integer, db.ForeignKey('users.UserID'), nullable=False)
+    FYID = db.Column(db.Integer, db.ForeignKey('financial_years.FYID'), nullable=False)
+    MonthID = db.Column(db.Integer, nullable=False)
+    UploadedHODMISIDs = db.Column(db.String(500), nullable=True)
+    ConsolidatedFilePath = db.Column(db.String(255), nullable=False)
+    Status = db.Column(db.String(50), default='Pending Review')
+    CreatedDate = db.Column(db.DateTime, default=lambda: datetime.now(IST))
+    ApprovedDate = db.Column(db.DateTime, nullable=True)
+    ApprovedBy = db.Column(db.Integer, db.ForeignKey('users.UserID'), nullable=True)
+    supervisor = db.relationship('User', foreign_keys=[SupervisorID], backref='consolidated_uploads')
+    financial_year = db.relationship('FinancialYear', backref='consolidated_mis')
+
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+    NotificationID = db.Column(db.Integer, primary_key=True)
+    UserID = db.Column(db.Integer, db.ForeignKey('users.UserID'), nullable=False)
+    Title = db.Column(db.String(200), nullable=False)
+    Message = db.Column(db.Text, nullable=False)
+    NotificationType = db.Column(db.String(50), nullable=False)
+    RelatedUploadID = db.Column(db.Integer, db.ForeignKey('mis_uploads.UploadID'), nullable=True)
+    RelatedConsolidatedID = db.Column(db.Integer, db.ForeignKey('consolidated_mis.ConsolidatedMISID'), nullable=True)
+    IsRead = db.Column(db.Boolean, default=False)
+    CreatedDate = db.Column(db.DateTime, default=lambda: datetime.now(IST))
+    user = db.relationship('User', backref='notifications')
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -120,6 +155,19 @@ def generate_mis_code(department_id):
     sequential_code = str(upload_count + 1).zfill(6)
     
     return f"MIS{dept_code}{sequential_code}"
+
+def create_notification(user_id, title, message, notif_type, upload_id=None, consolidated_id=None):
+    """Create in-app notification for a user"""
+    notification = Notification(
+        UserID=user_id,
+        Title=title,
+        Message=message,
+        NotificationType=notif_type,
+        RelatedUploadID=upload_id,
+        RelatedConsolidatedID=consolidated_id
+    )
+    db.session.add(notification)
+    db.session.commit()
 
 def login_required(f):
     from functools import wraps
@@ -181,6 +229,24 @@ def management_required(f):
             return redirect(url_for('login'))
         if user.role.RoleName != 'Management':
             flash('Access denied. Management privileges required.', 'error')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def supervisor_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please log in to access this page.', 'error')
+            return redirect(url_for('login'))
+        user = User.query.get(session['user_id'])
+        if not user or not user.IsActive:
+            session.clear()
+            flash('Your session has expired. Please log in again.', 'error')
+            return redirect(url_for('login'))
+        if user.role.RoleName != 'Supervisor':
+            flash('Access denied. Supervisor privileges required.', 'error')
             return redirect(url_for('dashboard'))
         return f(*args, **kwargs)
     return decorated_function
@@ -354,7 +420,9 @@ def dashboard():
     if user.role.RoleName == 'Admin':
         recent_uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).limit(5).all()
     elif user.role.RoleName == 'Management':
-        recent_uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).limit(5).all()
+        recent_uploads = ConsolidatedMIS.query.order_by(ConsolidatedMIS.CreatedDate.desc()).limit(5).all()
+    elif user.role.RoleName == 'Supervisor':
+        recent_uploads = MISUpload.query.filter_by(SupervisorApproved=False, IsCancelled=False).order_by(MISUpload.UploadDate.desc()).limit(5).all()
     elif user.role.RoleName == 'HOD':
         recent_uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).limit(5).all()
     else:
@@ -365,15 +433,20 @@ def dashboard():
     # Check upload window status
     upload_allowed, upload_message = check_upload_window()
     
-    # Get HOD count and pending uploads for admin and management
+    # Get HOD count and pending uploads for admin, supervisor and management
     hod_count = 0
     pending_uploads_count = 0
+    supervisor_pending_count = 0
+    supervisor_pending_uploads = []
     if user.role.RoleName == 'Admin':
         hod_role = Role.query.filter_by(RoleName='HOD').first()
         if hod_role:
             hod_count = User.query.filter_by(RoleID=hod_role.RoleID, IsActive=True).count()
+    if user.role.RoleName == 'Supervisor':
+        supervisor_pending_count = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).count()
+        supervisor_pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).limit(2).all()
     if user.role.RoleName == 'Management':
-        pending_uploads_count = MISUpload.query.filter_by(Status='In Review').count()
+        pending_uploads_count = ConsolidatedMIS.query.filter_by(Status='Pending Review').count()
     
     stats = {
         'total_users': User.query.count(),
@@ -385,12 +458,20 @@ def dashboard():
         'upload_message': upload_message,
         'hod_count': hod_count,
         'pending_uploads_count': pending_uploads_count,
+        'supervisor_pending_count': supervisor_pending_count,
+        'supervisor_pending_uploads': supervisor_pending_uploads,
         'email_configured': email_service.is_configured()
     }
     
+    # Calculate last day of current month
+    today = date.today()
+    last_day_of_month = calendar.monthrange(today.year, today.month)[1]
+    
     return render_template('dashboard.html', current_user=user, stats=stats, 
                           upload_window_start=UPLOAD_WINDOW_START_DAY, 
-                          upload_window_end=UPLOAD_WINDOW_END_DAY)
+                          upload_window_end=UPLOAD_WINDOW_END_DAY,
+                          supervisor_approval_start_day=SUPERVISOR_APPROVAL_START_DAY,
+                          supervisor_approval_end_day=last_day_of_month)
 
 
 @app.route('/my-uploads')
@@ -427,8 +508,15 @@ def reports():
         query = MISUpload.query
     elif user.role.RoleName == 'Management':
         query = MISUpload.query
+    elif user.role.RoleName == 'Supervisor':
+        # Supervisor sees all department records
+        query = MISUpload.query
     else:
+        # HOD sees only their department records
         query = MISUpload.query.filter_by(DepartmentID=user.DepartmentID)
+    
+    # Exclude cancelled uploads from all reports
+    query = query.filter_by(IsCancelled=False)
     
     # Apply filter parameters
     department_id = request.args.get('department', '')
@@ -475,12 +563,72 @@ def approval_queue():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    # Management role - get all uploads pending review from all departments
-    pending_uploads = MISUpload.query.filter_by(Status='In Review').order_by(MISUpload.UploadDate.desc()).all()
+    # Management role - get all uploads in review status from all departments
+    # Excludes cancelled uploads (when HOD deletes, upload is removed from approval queue)
+    pending_uploads = MISUpload.query.filter_by(Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
     
     return render_template('approval_queue.html', 
                          current_user=user,
                          pending_uploads=pending_uploads)
+
+@app.route('/management-history')
+@management_required
+def management_history():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get all MIS uploads with their complete history
+    all_uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Get filter parameters from query string
+    department_id = request.args.get('department_id', '')
+    fy_id = request.args.get('fy_id', '')
+    status = request.args.get('status', '')
+    
+    # Apply filters if provided
+    query = MISUpload.query
+    
+    if department_id:
+        query = query.filter_by(DepartmentID=int(department_id))
+    
+    if fy_id:
+        query = query.filter_by(FYID=int(fy_id))
+    
+    if status:
+        query = query.filter_by(Status=status)
+    
+    all_uploads = query.order_by(MISUpload.UploadDate.desc()).all()
+    
+    departments = Department.query.filter_by(ActiveFlag=True).all()
+    financial_years = FinancialYear.query.all()
+    
+    return render_template('management_history.html', 
+                         current_user=user,
+                         uploads=all_uploads,
+                         departments=departments,
+                         financial_years=financial_years,
+                         selected_department=department_id,
+                         selected_fy=fy_id,
+                         selected_status=status)
+
+@app.route('/approved-mis')
+@admin_required
+def approved_mis():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Admin role - get all approved MIS uploads from all departments
+    approved_uploads = MISUpload.query.filter_by(Status='Approved').order_by(MISUpload.UploadDate.desc()).all()
+    
+    return render_template('approved_mis.html', 
+                         current_user=user,
+                         uploads=approved_uploads)
 
 @app.route('/view-upload/<int:upload_id>')
 @login_required
@@ -703,6 +851,364 @@ This is an automated notification from the MIS Upload System.
     flash(f'Upload rejected. Notification sent to {upload.uploader.Username}.', 'warning')
     return redirect(url_for('approval_queue'))
 
+@app.route('/supervisor-uploads')
+@supervisor_required
+def supervisor_uploads():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    current_day = date.today().day
+    if current_day < 18:
+        flash('Supervisor approval window opens on the 18th of each month.', 'info')
+        pending_uploads = []
+    else:
+        pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Get supervisor approved and rejected uploads for history table
+    # Match the same filtering logic as supervisor_history route for consistency
+    approved_by_supervisor = MISUpload.query.filter_by(SupervisorApproved=True).filter(MISUpload.Status.in_(['In Review', 'Approved'])).order_by(MISUpload.SupervisorApprovedDate.desc()).all()
+    rejected_by_supervisor = MISUpload.query.filter_by(SupervisorApproved=False, Status='Rejected').order_by(MISUpload.UploadDate.desc()).all()
+    
+    return render_template('supervisor_uploads.html', current_user=user, pending_uploads=pending_uploads, approved_by_supervisor=approved_by_supervisor, rejected_by_supervisor=rejected_by_supervisor)
+
+@app.route('/supervisor-history')
+@supervisor_required
+def supervisor_history():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get approved and rejected uploads by supervisor
+    approved_uploads = MISUpload.query.filter_by(SupervisorApproved=True).filter(MISUpload.Status.in_(['In Review', 'Approved'])).order_by(MISUpload.SupervisorApprovedDate.desc()).all()
+    rejected_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='Rejected').order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Get consolidated MIS uploads from all supervisors (all departments)
+    approved_consolidated = ConsolidatedMIS.query.filter_by(Status='Approved').order_by(ConsolidatedMIS.ApprovedDate.desc()).all()
+    rejected_consolidated = ConsolidatedMIS.query.filter_by(Status='Rejected').order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    pending_consolidated = ConsolidatedMIS.query.filter_by(Status='Pending Review').order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    
+    return render_template('supervisor_history.html', current_user=user, approved_uploads=approved_uploads, rejected_uploads=rejected_uploads, 
+                         approved_consolidated=approved_consolidated, rejected_consolidated=rejected_consolidated, pending_consolidated=pending_consolidated)
+
+@app.route('/management-consolidated-history')
+@management_required
+def management_consolidated_history():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get approved and rejected consolidated MIS by management
+    approved_consolidated = ConsolidatedMIS.query.filter_by(Status='Approved').order_by(ConsolidatedMIS.ApprovedDate.desc()).all()
+    rejected_consolidated = ConsolidatedMIS.query.filter_by(Status='Rejected').order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    
+    return render_template('management_consolidated_history.html', current_user=user, approved_consolidated=approved_consolidated, rejected_consolidated=rejected_consolidated)
+
+@app.route('/view-supervisor-consolidated-mis/<int:consolidated_id>')
+@supervisor_required
+def view_supervisor_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    # Ensure supervisor can only view their own consolidated MIS
+    if consolidated.SupervisorID != user.UserID:
+        flash('Access denied.', 'error')
+        return redirect(url_for('supervisor_history'))
+    
+    hod_uploads = MISUpload.query.filter(MISUpload.UploadID.in_([int(x) for x in consolidated.UploadedHODMISIDs.split(',')])).all() if consolidated.UploadedHODMISIDs else []
+    
+    # Get approver info
+    approver = User.query.get(consolidated.ApprovedBy) if consolidated.ApprovedBy else None
+    
+    return render_template('view_supervisor_consolidated_mis.html', current_user=user, consolidated=consolidated, hod_uploads=hod_uploads, approver=approver)
+
+@app.route('/view-hod-upload/<int:upload_id>')
+@supervisor_required
+def view_hod_upload(upload_id):
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    upload = MISUpload.query.get_or_404(upload_id)
+    return render_template('view_hod_upload.html', current_user=user, upload=upload)
+
+@app.route('/approve-hod-upload/<int:upload_id>', methods=['POST'])
+@supervisor_required
+def approve_hod_upload(upload_id):
+    user = User.query.get(session['user_id'])
+    current_day = date.today().day
+    
+    if current_day < 18:
+        flash('Supervisor approval window opens on the 18th of each month.', 'error')
+        return redirect(url_for('supervisor_uploads'))
+    
+    upload = MISUpload.query.get_or_404(upload_id)
+    upload.SupervisorApproved = True
+    upload.SupervisorApprovedBy = user.UserID
+    upload.SupervisorApprovedDate = datetime.now(IST)
+    db.session.commit()
+    
+    # Create in-app notification for HOD
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    month_name = month_names[upload.MonthID]
+    create_notification(upload.UploadedBy, 'MIS Approved by Supervisor', f'Your MIS upload {upload.UploadCode} for {month_name} has been approved by the Supervisor and is pending Management review.', 'approval', upload_id=upload_id)
+    
+    if email_service.is_configured():
+        uploader = upload.uploader
+        subject = f"MIS Upload Approved by Supervisor - {upload.department.DeptName} - {month_name}"
+        html_content = f"""<!DOCTYPE html><html><head><style>body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }} .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }} .header {{ background-color: #3b82f6; color: white; padding: 20px; border-radius: 5px 5px 0 0; }} .content {{ background-color: #f9fafb; padding: 30px; border: 1px solid #e5e7eb; }} .success-box {{ background-color: #dbeafe; border-left: 4px solid #3b82f6; padding: 15px; margin: 20px 0; }}</style></head><body><div class="container"><div class="header"><h2>MIS Upload Approved - Supervisor Review</h2></div><div class="content"><p>Dear {uploader.Username},</p><div class="success-box"><strong>Your MIS upload has been approved by the Supervisor!</strong><br>It is now pending Management's final review.</div><p><strong>Details:</strong> {upload.department.DeptName} | {month_name} {upload.financial_year.FYName} | Code: {upload.UploadCode}</p><p>You will be notified once Management completes their review.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></body></html>"""
+        email_service.send_email(uploader.Email, subject, html_content)
+    
+    flash('HOD MIS approved successfully!', 'success')
+    return redirect(url_for('supervisor_uploads'))
+
+@app.route('/reject-hod-upload/<int:upload_id>', methods=['POST'])
+@supervisor_required
+def reject_hod_upload(upload_id):
+    user = User.query.get(session['user_id'])
+    upload = MISUpload.query.get_or_404(upload_id)
+    upload.Status = 'Rejected'
+    db.session.commit()
+    
+    # Create in-app notification for HOD
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    month_name = month_names[upload.MonthID]
+    create_notification(upload.UploadedBy, 'MIS Rejected by Supervisor', f'Your MIS upload {upload.UploadCode} for {month_name} has been rejected by the Supervisor. Please review and resubmit.', 'rejection', upload_id=upload_id)
+    
+    if email_service.is_configured():
+        uploader = upload.uploader
+        subject = f"MIS Upload Rejected - {upload.department.DeptName} - {month_name}"
+        html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #ef4444; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>MIS Upload Rejected</h2></div><div style="background-color: white; padding: 30px;"><p>Dear {uploader.Username},</p><p>Your MIS upload for {upload.department.DeptName} ({month_name}) has been rejected by the Supervisor.</p><p>Please review and resubmit your MIS upload.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+        email_service.send_email(uploader.Email, subject, html_content)
+    
+    flash('HOD MIS rejected. Notification sent to uploader.', 'warning')
+    return redirect(url_for('supervisor_uploads'))
+
+@app.route('/prepare-consolidated-mis')
+@supervisor_required
+def prepare_consolidated_mis():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    current_day = date.today().day
+    if current_day < 18:
+        flash('Consolidated MIS preparation begins on the 18th.', 'info')
+        approved_uploads = []
+    else:
+        approved_uploads = MISUpload.query.filter_by(SupervisorApproved=True, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Get all uploads with management approval/rejection status
+    in_review_uploads = MISUpload.query.filter_by(Status='In Review').order_by(MISUpload.UploadDate.desc()).all()
+    approved_by_management = MISUpload.query.filter_by(Status='Approved').order_by(MISUpload.UploadDate.desc()).all()
+    rejected_by_management = MISUpload.query.filter_by(Status='Rejected').order_by(MISUpload.UploadDate.desc()).all()
+    
+    return render_template('prepare_consolidated_mis.html', current_user=user, approved_uploads=approved_uploads, in_review_uploads=in_review_uploads, approved_by_management=approved_by_management, rejected_by_management=rejected_by_management)
+
+@app.route('/upload-consolidated-mis', methods=['POST'])
+@supervisor_required
+def upload_consolidated_mis():
+    user = User.query.get(session['user_id'])
+    current_day = date.today().day
+    
+    if current_day < 18:
+        flash('Consolidated MIS submission begins on the 18th.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    if 'consolidated_file' not in request.files:
+        flash('No file selected.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    file = request.files['consolidated_file']
+    if not file or not file.filename:
+        flash('No file selected.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    if not (file.filename.endswith('.xls') or file.filename.endswith('.xlsx')):
+        flash('Only .xls or .xlsx files are allowed.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    selected_uploads = request.form.getlist('selected_uploads')
+    if not selected_uploads:
+        flash('Please select at least one HOD MIS upload.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
+    current_month = date.today().month
+    
+    upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'ConsolidatedMIS', active_fy.FYName if active_fy else 'General')
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    filename = secure_filename(f"ConsolidatedMIS_{current_month:02d}_{active_fy.FYName if active_fy else 'General'}_{file.filename}")
+    filepath = os.path.join(upload_dir, filename)
+    file.save(filepath)
+    
+    is_valid, validation_message = validate_excel_file(filepath)
+    if not is_valid:
+        os.remove(filepath)
+        flash(f'Validation Error: {validation_message}', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
+    
+    consolidated = ConsolidatedMIS(SupervisorID=user.UserID, FYID=active_fy.FYID if active_fy else 1, MonthID=current_month, UploadedHODMISIDs=','.join(selected_uploads), ConsolidatedFilePath=filepath, Status='Pending Review')
+    db.session.add(consolidated)
+    db.session.commit()
+    
+    # Send email notifications to all Management users
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    month_name = month_names[current_month]
+    if email_service.is_configured():
+        management_role = Role.query.filter_by(RoleName='Management').first()
+        if management_role:
+            management_users = User.query.filter_by(RoleID=management_role.RoleID, IsActive=True).all()
+            for mgmt_user in management_users:
+                subject = f"New Consolidated MIS for Review - {month_name}"
+                html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #f97316; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>New Consolidated MIS Submitted</h2></div><div style="background-color: white; padding: 30px;"><p>Dear {mgmt_user.Username},</p><p>A new consolidated MIS for {month_name} has been submitted by {user.Username} from {user.department.DeptName} department.</p><p>Please review and approve/reject as appropriate.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+                email_service.send_email(mgmt_user.Email, subject, html_content)
+    
+    flash('Consolidated MIS uploaded successfully! Management will now review it.', 'success')
+    return redirect(url_for('prepare_consolidated_mis'))
+
+@app.route('/management-consolidated-queue')
+@management_required
+def management_consolidated_queue():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    consolidated_uploads = ConsolidatedMIS.query.filter_by(Status='Pending Review').order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    return render_template('management_consolidated_queue.html', current_user=user, consolidated_uploads=consolidated_uploads)
+
+@app.route('/view-consolidated-mis/<int:consolidated_id>')
+@management_required
+def view_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    hod_uploads = MISUpload.query.filter(MISUpload.UploadID.in_([int(x) for x in consolidated.UploadedHODMISIDs.split(',')])).all() if consolidated.UploadedHODMISIDs else []
+    return render_template('view_consolidated_mis.html', current_user=user, consolidated=consolidated, hod_uploads=hod_uploads)
+
+@app.route('/approve-consolidated-mis/<int:consolidated_id>', methods=['POST'])
+@management_required
+def approve_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    consolidated.Status = 'Approved'
+    consolidated.ApprovedDate = datetime.now(IST)
+    consolidated.ApprovedBy = user.UserID
+    
+    hod_ids = set()
+    for upload_id in consolidated.UploadedHODMISIDs.split(','):
+        upload = MISUpload.query.get(int(upload_id))
+        if upload:
+            upload.Status = 'Approved'
+            hod_ids.add(upload.UploadedBy)
+    
+    db.session.commit()
+    
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    month_name = month_names[consolidated.MonthID]
+    
+    # Create notification for supervisor
+    create_notification(consolidated.SupervisorID, 'Consolidated MIS Approved', f'Your consolidated MIS for {month_name} has been approved by Management.', 'management_approval', consolidated_id=consolidated_id)
+    
+    # Create notifications for all HODs in the consolidated upload
+    for hod_id in hod_ids:
+        create_notification(hod_id, 'MIS Approved by Management', f'Your MIS included in the consolidated MIS for {month_name} has been approved by Management.', 'management_approval')
+    
+    if email_service.is_configured():
+        supervisor = consolidated.supervisor
+        subject = f"Consolidated MIS Approved - {month_name}"
+        html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial; background-color: #f9fafb;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #10b981; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>✓ Consolidated MIS Approved</h2></div><div style="background-color: white; padding: 30px; border: 1px solid #e5e7eb;"><p>Dear {supervisor.Username},</p><p>Your consolidated MIS for {month_name} has been <strong>approved by Management</strong>.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+        email_service.send_email(supervisor.Email, subject, html_content)
+        
+        # Send emails to all HODs
+        for hod_id in hod_ids:
+            hod = User.query.get(hod_id)
+            if hod:
+                subject = f"MIS Approved by Management - {month_name}"
+                html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #10b981; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>MIS Approved</h2></div><div style="background-color: white; padding: 30px;"><p>Dear {hod.Username},</p><p>Your MIS for {month_name} has been approved by Management.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+                email_service.send_email(hod.Email, subject, html_content)
+    
+    flash('Consolidated MIS approved! All HOD uploads marked as approved.', 'success')
+    return redirect(url_for('management_consolidated_queue'))
+
+@app.route('/reject-consolidated-mis/<int:consolidated_id>', methods=['POST'])
+@management_required
+def reject_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    consolidated.Status = 'Rejected'
+    db.session.commit()
+    
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    month_name = month_names[consolidated.MonthID]
+    
+    # Get HOD IDs from consolidated uploads
+    hod_ids = set()
+    for upload_id in consolidated.UploadedHODMISIDs.split(','):
+        upload = MISUpload.query.get(int(upload_id))
+        if upload:
+            hod_ids.add(upload.UploadedBy)
+    
+    # Create notification for supervisor
+    create_notification(consolidated.SupervisorID, 'Consolidated MIS Rejected', f'Your consolidated MIS for {month_name} has been rejected by Management. Please review and resubmit.', 'management_rejection', consolidated_id=consolidated_id)
+    
+    # Create notifications for all HODs
+    for hod_id in hod_ids:
+        create_notification(hod_id, 'MIS Rejected by Management', f'Your MIS included in the consolidated MIS for {month_name} has been rejected by Management.', 'management_rejection')
+    
+    if email_service.is_configured():
+        supervisor = consolidated.supervisor
+        subject = f"Consolidated MIS Rejected - {month_name}"
+        html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #ef4444; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>✗ Consolidated MIS Rejected</h2></div><div style="background-color: white; padding: 30px;"><p>Dear {supervisor.Username},</p><p>Your consolidated MIS for {month_name} has been rejected by Management. Please review and resubmit.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+        email_service.send_email(supervisor.Email, subject, html_content)
+        
+        # Send emails to all HODs
+        for hod_id in hod_ids:
+            hod = User.query.get(hod_id)
+            if hod:
+                subject = f"MIS Rejected by Management - {month_name}"
+                html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #ef4444; color: white; padding: 20px; border-radius: 5px 5px 0 0;"><h2>MIS Rejected</h2></div><div style="background-color: white; padding: 30px;"><p>Dear {hod.Username},</p><p>Your MIS for {month_name} has been rejected by Management. Please review and resubmit.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+                email_service.send_email(hod.Email, subject, html_content)
+    
+    flash('Consolidated MIS rejected. Notifications sent to supervisor and HODs.', 'warning')
+    return redirect(url_for('management_consolidated_queue'))
+
+@app.route('/download-consolidated-mis/<int:consolidated_id>')
+@management_required
+def download_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    from flask import send_file
+    try:
+        filename = consolidated.ConsolidatedFilePath.split('/')[-1]
+        return send_file(consolidated.ConsolidatedFilePath, as_attachment=True, download_name=filename)
+    except Exception as e:
+        flash(f'Error downloading file: {str(e)}', 'error')
+        return redirect(url_for('management_consolidated_queue'))
+
 @app.route('/download-upload/<int:upload_id>')
 @login_required
 def download_upload(upload_id):
@@ -723,32 +1229,146 @@ def download_upload(upload_id):
         return redirect(url_for('reports'))
 
 @app.route('/delete-upload/<int:upload_id>', methods=['POST'])
-@hod_required
+@login_required
 def delete_upload(upload_id):
     user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
     upload = MISUpload.query.get_or_404(upload_id)
     
-    # Can only delete uploads with "In Review" status
-    if upload.Status != 'In Review':
-        flash(f'Cannot delete uploads with status "{upload.Status}". Only "In Review" uploads can be deleted.', 'error')
+    # Admin can delete any upload (In Review or Approved, any time)
+    if user.role.RoleName == 'Admin':
+        try:
+            if os.path.exists(upload.FilePath):
+                os.remove(upload.FilePath)
+        except Exception as e:
+            flash(f'Warning: File deletion error: {str(e)}', 'warning')
+        
+        db.session.delete(upload)
+        db.session.commit()
+        flash('Upload deleted successfully!', 'success')
         return redirect(url_for('reports'))
     
-    # HOD can only delete from their department
-    if user.role.RoleName == 'HOD' and upload.DepartmentID != user.DepartmentID:
-        flash('You can only delete uploads from your department.', 'error')
-        return redirect(url_for('reports'))
+    # HOD can only delete "In Review" uploads from their department
+    if user.role.RoleName == 'HOD':
+        if upload.Status != 'In Review':
+            flash(f'Cannot delete uploads with status "{upload.Status}". Only "In Review" uploads can be deleted.', 'error')
+            return redirect(url_for('my_uploads'))
+        
+        if upload.DepartmentID != user.DepartmentID:
+            flash('You can only delete uploads from your department.', 'error')
+            return redirect(url_for('my_uploads'))
+        
+        try:
+            if os.path.exists(upload.FilePath):
+                os.remove(upload.FilePath)
+        except Exception as e:
+            flash(f'Warning: File deletion error: {str(e)}', 'warning')
+        
+        # Mark as cancelled instead of deleting so Management can see it was cancelled
+        upload.IsCancelled = True
+        db.session.commit()
+        flash('Upload marked as cancelled. Management will see this change.', 'success')
+        return redirect(url_for('my_uploads'))
     
-    # Delete the file from filesystem
-    try:
-        if os.path.exists(upload.FilePath):
-            os.remove(upload.FilePath)
-    except Exception as e:
-        flash(f'Warning: File deletion error: {str(e)}', 'warning')
-    
-    db.session.delete(upload)
-    db.session.commit()
-    flash('Upload deleted successfully!', 'success')
+    # Other roles cannot delete
+    flash('You do not have permission to delete uploads.', 'error')
     return redirect(url_for('reports'))
+
+@app.route('/edit-upload/<int:upload_id>', methods=['GET', 'POST'])
+@login_required
+def edit_upload(upload_id):
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    upload = MISUpload.query.get_or_404(upload_id)
+    
+    # Check permissions
+    # Admin can edit any upload anytime
+    # HOD can only edit "In Review" uploads from their department
+    if user.role.RoleName == 'HOD':
+        if upload.DepartmentID != user.DepartmentID:
+            flash('You can only edit uploads from your department.', 'error')
+            return redirect(url_for('my_uploads'))
+        
+        if upload.Status != 'In Review':
+            flash(f'Cannot modify uploads with status "{upload.Status}". Only "In Review" uploads can be modified.', 'error')
+            return redirect(url_for('my_uploads'))
+    elif user.role.RoleName != 'Admin':
+        flash('You do not have permission to edit uploads.', 'error')
+        return redirect(url_for('reports'))
+    
+    # GET request - show edit form
+    if request.method == 'GET':
+        financial_years = FinancialYear.query.all()
+        departments = Department.query.all() if user.role.RoleName == 'Admin' else Department.query.filter_by(DeptID=user.DepartmentID).all()
+        
+        return render_template('edit_upload.html',
+                             current_user=user,
+                             upload=upload,
+                             departments=departments,
+                             financial_years=financial_years)
+    
+    # POST request - handle file update
+    if 'file' in request.files:
+        file = request.files['file']
+        
+        if file and file.filename:
+            if not (file.filename.endswith('.xls') or file.filename.endswith('.xlsx')):
+                flash('Only .xls or .xlsx files are allowed.', 'error')
+                return redirect(url_for('edit_upload', upload_id=upload_id))
+            
+            # Validate Excel file
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
+            file.save(temp_path)
+            
+            is_valid, validation_message = validate_excel_file(temp_path)
+            
+            if not is_valid:
+                os.remove(temp_path)
+                flash(f'Validation Error: {validation_message}', 'error')
+                return redirect(url_for('edit_upload', upload_id=upload_id))
+            
+            # Delete old file
+            try:
+                if os.path.exists(upload.FilePath):
+                    os.remove(upload.FilePath)
+            except Exception as e:
+                flash(f'Warning: Error deleting old file: {str(e)}', 'warning')
+            
+            # Move new file to upload location
+            fy = upload.financial_year
+            dept = upload.department
+            month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+            
+            upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], fy.FYName, dept.DeptName, month_names[upload.MonthID])
+            os.makedirs(upload_dir, exist_ok=True)
+            
+            filename = secure_filename(f"{dept.DeptName}_{month_names[upload.MonthID]}_{fy.FYName}_{file.filename}")
+            filepath = os.path.join(upload_dir, filename)
+            
+            os.rename(temp_path, filepath)
+            
+            # Update upload record
+            upload.FilePath = filepath
+            upload.FileCheck = 'Validated'
+            upload.UploadDate = datetime.now(IST)
+            # Mark as modified for HOD so Management can see changes
+            if user.role.RoleName == 'HOD':
+                upload.IsModified = True
+            db.session.commit()
+            
+            flash('✓ File updated successfully! Management will see this upload was modified.', 'success')
+            return redirect(url_for('my_uploads'))
+    
+    flash('No file provided for update.', 'error')
+    return redirect(url_for('edit_upload', upload_id=upload_id))
 
 @app.route('/config-master')
 @admin_required
@@ -1232,16 +1852,36 @@ def mis_upload():
         upload_allowed, upload_message = check_upload_window()
         departments = Department.query.all()
         uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
+        hod_blocked_message = None
     elif user.role.RoleName == 'Management':
         upload_allowed = False
         upload_message = "Management role cannot upload MIS. Please use the Approval Queue to review and approve uploads."
         departments = Department.query.all()
         uploads = MISUpload.query.order_by(MISUpload.UploadDate.desc()).all()
+        hod_blocked_message = None
     else:
         upload_allowed, upload_message = check_upload_window()
         # HOD can only see their department
         departments = Department.query.filter_by(DeptID=user.DepartmentID).all()
         uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).all()
+        
+        # Check if HOD already has an approved MIS for current month
+        current_month = date.today().month
+        active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
+        fy_id = active_fy.FYID if active_fy else None
+        
+        approved_upload = MISUpload.query.filter_by(
+            DepartmentID=user.DepartmentID,
+            MonthID=current_month,
+            FYID=fy_id,
+            Status='Approved'
+        ).first() if fy_id else None
+        
+        if approved_upload:
+            upload_allowed = False
+            hod_blocked_message = f"An approved MIS upload already exists for {['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][current_month]}. No new uploads are allowed for this period."
+        else:
+            hod_blocked_message = None
     
     financial_years = FinancialYear.query.all()
     
@@ -1249,6 +1889,7 @@ def mis_upload():
                                  current_user=user,
                                  upload_allowed=upload_allowed,
                                  upload_message=upload_message,
+                                 hod_blocked_message=hod_blocked_message,
                                  current_date=date.today().strftime('%Y-%m-%d'),
                                  departments=departments,
                                  financial_years=financial_years,
@@ -1299,22 +1940,34 @@ def upload_mis():
         flash('All fields are required.', 'error')
         return redirect(url_for('mis_upload'))
     
+    # Get FY and Department names for organized storage
+    fy = FinancialYear.query.get(fy_id)
+    dept = Department.query.get(department_id)
+    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+    
     # HOD users can only upload for current month
     if user.role.RoleName == 'HOD':
         current_month = date.today().month
         if int(month_id) != current_month:
             flash(f'HOD users can only upload MIS data for the current month (Month {current_month}). Old month uploads are not allowed.', 'error')
             return redirect(url_for('mis_upload'))
+        
+        # Check if HOD already has an approved MIS for current month and FY
+        approved_upload = MISUpload.query.filter_by(
+            DepartmentID=user.DepartmentID,
+            MonthID=current_month,
+            FYID=fy_id,
+            Status='Approved'
+        ).first()
+        
+        if approved_upload:
+            flash(f'An approved MIS upload already exists for {month_names[current_month]} {fy.FYName}. No new uploads are allowed for this period.', 'error')
+            return redirect(url_for('mis_upload'))
     
     # HOD can only upload for their own department
     if user.role.RoleName == 'HOD' and int(department_id) != user.DepartmentID:
         flash('You can only upload for your own department.', 'error')
         return redirect(url_for('mis_upload'))
-    
-    # Get FY and Department names for organized storage
-    fy = FinancialYear.query.get(fy_id)
-    dept = Department.query.get(department_id)
-    month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
     
     # Create organized directory structure: /MISUploads/[FY]/[Department]/[Month]/
     upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], fy.FYName, dept.DeptName, month_names[int(month_id)])
@@ -1491,6 +2144,7 @@ def init_db():
             roles = [
                 Role(RoleName='Admin'),  # type: ignore
                 Role(RoleName='Management'),  # type: ignore
+                Role(RoleName='Supervisor'),  # type: ignore
                 Role(RoleName='HOD')  # type: ignore
             ]
             db.session.add_all(roles)
@@ -1527,13 +2181,14 @@ def init_db():
         if User.query.count() == 0:
             admin_role = Role.query.filter_by(RoleName='Admin').first()
             management_role = Role.query.filter_by(RoleName='Management').first()
+            supervisor_role = Role.query.filter_by(RoleName='Supervisor').first()
             hod_role = Role.query.filter_by(RoleName='HOD').first()
             
             finance_dept = Department.query.filter_by(DeptName='Finance').first()
             hr_dept = Department.query.filter_by(DeptName='HR').first()
             it_dept = Department.query.filter_by(DeptName='IT').first()
             
-            if admin_role and management_role and hod_role and finance_dept and hr_dept and it_dept:
+            if admin_role and management_role and supervisor_role and hod_role and finance_dept and hr_dept and it_dept:
                 users = [
                     User(  # type: ignore
                         EmpID='EMP001',
@@ -1554,6 +2209,18 @@ def init_db():
                         PasswordHash=hash_password('manager123'),
                         DepartmentID=finance_dept.DeptID,
                         RoleID=management_role.RoleID,
+                        IsActive=True,
+                        FailedLoginAttempts=0,
+                        PasswordLastChanged=datetime.now(IST),
+                        PasswordExpiryDate=datetime.now(IST) + timedelta(days=90)
+                    ),
+                    User(  # type: ignore
+                        EmpID='EMP006',
+                        Username='Supervisor',
+                        Email='supervisor@gmail.com',
+                        PasswordHash=hash_password('supervisor123'),
+                        DepartmentID=finance_dept.DeptID,
+                        RoleID=supervisor_role.RoleID,
                         IsActive=True,
                         FailedLoginAttempts=0,
                         PasswordLastChanged=datetime.now(IST),
@@ -1601,6 +2268,7 @@ def init_db():
                 print("✓ Test users created:")
                 print("  - Admin: emp_id='EMP001', password='admin123' (IT Dept)")
                 print("  - Management: emp_id='EMP005', password='manager123' (Approver)")
+                print("  - Supervisor: emp_id='EMP006', password='supervisor123' (MIS Consolidator)")
                 print("  - HOD Finance: emp_id='EMP002', password='hod123'")
                 print("  - HOD HR: emp_id='EMP003', password='hod123'")
                 print("  - HOD IT: emp_id='EMP004', password='hod123'")
@@ -1734,9 +2402,33 @@ def setup_scheduler():
         replace_existing=True
     )
     
+    # Supervisor approval window opens on 18th
+    def send_supervisor_reminder():
+        try:
+            with app.app_context():
+                supervisor_role = Role.query.filter_by(RoleName='Supervisor').first()
+                if supervisor_role and email_service.is_configured():
+                    supervisors = User.query.filter_by(RoleID=supervisor_role.RoleID, IsActive=True).all()
+                    for supervisor in supervisors:
+                        subject = f"Supervisor Approval Window Open - MIS Review Period Begins"
+                        html_content = f"""<!DOCTYPE html><html><body style="font-family: Arial;"><div style="max-width: 600px; margin: 0 auto; padding: 20px;"><div style="background-color: #8b5cf6; color: white; padding: 20px;"><h2>MIS Supervisor Approval Window Open</h2></div><div style="background-color: #f9fafb; padding: 30px;"><p>Dear {supervisor.Username},</p><p>The supervisor approval window is now open. Please review all pending HOD MIS uploads and approve them for Management review.</p><p>Access the system to begin reviewing uploads.</p><p>Best regards,<br><strong>MIS System Team</strong></p></div></div></body></html>"""
+                        email_service.send_email(supervisor.Email, subject, html_content)
+                    logging.info(f"Supervisor approval reminder sent to {len(supervisors)} supervisors")
+        except Exception as e:
+            logging.error(f"Error in supervisor reminder: {str(e)}")
+    
+    scheduler.add_job(
+        send_supervisor_reminder,
+        trigger=CronTrigger(day=SUPERVISOR_APPROVAL_START_DAY, hour=SUPERVISOR_APPROVAL_HOUR, minute=SUPERVISOR_APPROVAL_MINUTE, timezone=IST),
+        id='supervisor_approval_reminder',
+        name=f'Send supervisor approval window reminder ({SUPERVISOR_APPROVAL_START_DAY}th at {SUPERVISOR_APPROVAL_HOUR:02d}:{SUPERVISOR_APPROVAL_MINUTE:02d})',
+        replace_existing=True
+    )
+    
     scheduler.start()
-    logging.info("✓ Scheduler started with 3 automated events:")
+    logging.info("✓ Scheduler started with 4 automated events:")
     logging.info(f"  - {UPLOAD_WINDOW_START_DAY}st at {UPLOAD_WINDOW_OPEN_HOUR:02d}:{UPLOAD_WINDOW_OPEN_MINUTE:02d}: Upload window opens")
+    logging.info(f"  - {SUPERVISOR_APPROVAL_START_DAY}th at {SUPERVISOR_APPROVAL_HOUR:02d}:{SUPERVISOR_APPROVAL_MINUTE:02d}: Supervisor approval window opens")
     logging.info(f"  - {UPLOAD_WINDOW_REMINDER_DAY}th at {UPLOAD_WINDOW_REMINDER_HOUR:02d}:{UPLOAD_WINDOW_REMINDER_MINUTE:02d}: Final reminder")
     logging.info(f"  - {UPLOAD_LOCK_DAY}th at {UPLOAD_WINDOW_LOCK_HOUR:02d}:{UPLOAD_WINDOW_LOCK_MINUTE:02d}: Upload lock")
     
