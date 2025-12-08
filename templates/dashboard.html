@@ -60,10 +60,10 @@ View
     </div>
     {% endif %}
     {% if current_user.role.RoleName == 'Admin' %}
-    
+
     {% endif %}
 
-    {% if current_user.role.RoleName in ['Admin', 'Management'] %}
+    {% if current_user.role.RoleName == 'Management' %}
     {% if stats.pending_uploads_count > 0 %}
     <div class="mb-6 p-4 bg-orange-50 border-l-4 border-orange-500 rounded-lg">
         <div class="flex items-start gap-4">
@@ -71,11 +71,35 @@ View
                 <i class="fas fa-bell"></i>
             </div>
             <div class="flex-1">
-                <h3 class="text-lg font-bold text-orange-800 mb-1">Pending Approvals</h3>
-                <p class="text-orange-700 mb-3">You have {{ stats.pending_uploads_count }} MIS upload(s) waiting for approval.</p>
-                <a href="{{ url_for('approval_queue') }}" class="inline-block px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 transition-colors text-sm font-medium">
-                    <i class="fas fa-eye mr-2"></i>View Approval Queue
+                <h3 class="text-lg font-bold text-orange-800 mb-3">Pending Consolidated MIS</h3>
+                <div class="space-y-2 mb-3">
+                    {% for consolidated in stats.management_pending_consolidated %}
+                    <div class="bg-white p-3 rounded-lg border border-orange-200">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <p class="font-semibold text-gray-800">
+                                    Consolidated MIS - {{ ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][consolidated.MonthID] }} {{ consolidated.financial_year.FYName }}
+                                </p>
+                                <p class="text-sm text-gray-600">
+                                    Prepared by {{ consolidated.supervisor.Username or consolidated.supervisor.EmpID }} on {{ consolidated.CreatedDate.strftime('%d %b %Y') }}
+                                </p>
+                            </div>
+                            <a href="{{ url_for('view_consolidated_mis', consolidated_id=consolidated.ConsolidatedMISID) }}" class="text-blue-600 hover:text-blue-800 font-medium text-sm whitespace-nowrap ml-2">
+                                <i class="fas fa-arrow-right"></i>
+                            </a>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% if stats.pending_uploads_count > 2 %}
+                <a href="{{ url_for('management_consolidated_queue') }}" class="inline-block px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 transition-colors text-sm font-medium">
+                    <i class="fas fa-eye mr-2"></i>View All ({{ stats.pending_uploads_count }} total)
                 </a>
+                {% else %}
+                <a href="{{ url_for('management_consolidated_queue') }}" class="inline-block px-4 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 transition-colors text-sm font-medium">
+                    <i class="fas fa-check-double mr-2"></i>Review All
+                </a>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -108,6 +132,121 @@ View
             <div class="stat-value text-xl">{{ stats.active_fy }}</div>
             <div class="stat-label">Active Financial Year</div>
         </div>
+    </div>
+
+    <!-- Data Analytics Section -->
+    <div class="card p-6 mb-8">
+        <h3 class="text-2xl font-bold mb-6 text-gray-800 flex items-center gap-2">
+            <i class="fas fa-chart-line text-blue-600"></i> Data Analytics & Insights
+        </h3>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div class="bg-gradient-to-br from-cyan-500 to-cyan-600 rounded-lg p-4 text-white">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-cyan-100 text-sm mb-1">Total Data Records</p>
+                        <p class="text-3xl font-bold">{{ "{:,}".format(stats.data_insights.total_records) }}</p>
+                    </div>
+                    <i class="fas fa-database text-3xl opacity-50"></i>
+                </div>
+            </div>
+
+            <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-lg p-4 text-white">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-purple-100 text-sm mb-1">Data Points Analyzed</p>
+                        <p class="text-3xl font-bold">{{ "{:,}".format(stats.data_insights.total_data_points) }}</p>
+                    </div>
+                    <i class="fas fa-chart-bar text-3xl opacity-50"></i>
+                </div>
+            </div>
+
+            <div class="bg-gradient-to-br from-pink-500 to-pink-600 rounded-lg p-4 text-white">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-pink-100 text-sm mb-1">Departments Reporting</p>
+                        <p class="text-3xl font-bold">{{ stats.data_insights.departments_count }}</p>
+                    </div>
+                    <i class="fas fa-building text-3xl opacity-50"></i>
+                </div>
+            </div>
+
+            <div class="bg-gradient-to-br from-orange-500 to-orange-600 rounded-lg p-4 text-white">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-orange-100 text-sm mb-1">Active Months</p>
+                        <p class="text-3xl font-bold">{{ stats.data_insights.monthly_breakdown|length }}</p>
+                    </div>
+                    <i class="fas fa-calendar-check text-3xl opacity-50"></i>
+                </div>
+            </div>
+        </div>
+
+        <!-- Monthly Breakdown Chart -->
+        {% if stats.data_insights.monthly_breakdown %}
+        <div class="bg-gray-50 rounded-lg p-4">
+            <h4 class="text-lg font-bold mb-4 text-gray-800">
+                <i class="fas fa-chart-area text-indigo-600 mr-2"></i> Monthly Data Trends
+            </h4>
+            <canvas id="monthlyDataChart" style="max-height: 250px;"></canvas>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+        <script>
+            const monthlyData = {{ stats.data_insights.monthly_breakdown | tojson }};
+            const months = Object.keys(monthlyData);
+            const records = Object.values(monthlyData);
+
+            const ctx = document.getElementById('monthlyDataChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: months,
+                    datasets: [{
+                        label: 'Total Records',
+                        data: records,
+                        backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                        borderColor: 'rgba(59, 130, 246, 1)',
+                        borderWidth: 2,
+                        borderRadius: 8
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return context.dataset.label + ': ' + context.parsed.y.toLocaleString() + ' records';
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toLocaleString();
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        </script>
+        {% else %}
+        <div class="bg-gray-50 rounded-lg p-8 text-center">
+            <i class="fas fa-chart-line text-5xl text-gray-300 mb-3"></i>
+            <p class="text-gray-500">No approved data available for analysis yet.</p>
+            <p class="text-sm text-gray-400 mt-1">Upload and approve MIS reports to see data insights.</p>
+        </div>
+        {% endif %}
     </div>
     {% endif %}
 
@@ -216,11 +355,16 @@ View
                     <i class="fas fa-check-circle mr-1"></i>
                 </div>
                 <div class="flex-1">
-                    <h3 class="text-xl font-bold mb-2 text-gray-800">View Approved MIS</h3>
-                    <p class="text-gray-600 mb-4 text-sm">Review approved MIS uploads</p>
-                    <a href="{{ url_for('approved_mis') }}" class="btn btn-primary text-sm">
-                        <i class="fas fa-check-double mr-2"></i> Review MIS
-                    </a>
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Approved MIS</h3>
+                    <p class="text-gray-600 mb-4 text-sm">View and manage all approved MIS uploads</p>
+                    <div class="flex gap-2">
+                        <a href="{{ url_for('approved_mis') }}" class="btn btn-primary text-sm">
+                            <i class="fas fa-folder-open mr-1"></i> Individual MIS
+                        </a>
+                        <a href="{{ url_for('admin_consolidated_management') }}" class="btn bg-purple-600 text-white hover:bg-purple-700 text-sm">
+                            <i class="fas fa-layer-group mr-1"></i> Consolidated MIS
+                        </a>
+                    </div>
                 </div>
             </div>
         </div>
@@ -268,7 +412,7 @@ View
             </div>
         </div>
         {% endif %}
-        
+
         <div class="card p-6 hover:shadow-xl transition-all">
             <div class="flex items-start gap-4">
                 <div class="bg-purple-100 p-3 rounded-lg">
@@ -316,6 +460,21 @@ View
                     <p class="text-gray-600 mb-4 text-sm">Review and approve consolidated MIS</p>
                     <a href="{{ url_for('management_consolidated_queue') }}" class="btn btn-primary text-sm">
                         <i class="fas fa-check-circle mr-2"></i> Review Consolidated
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <div class="card p-6 hover:shadow-xl transition-all">
+            <div class="flex items-start gap-4">
+                <div class="bg-purple-100 p-3 rounded-lg">
+                    <i class="fas fa-file-alt text-purple-600 text-2xl"></i>
+                </div>
+                <div class="flex-1">
+                    <h3 class="text-xl font-bold mb-2 text-gray-800">Consolidated Reports</h3>
+                    <p class="text-gray-600 mb-4 text-sm">View and download all consolidated MIS reports</p>
+                    <a href="{{ url_for('management_consolidated_reports') }}" class="btn btn-primary text-sm">
+                        <i class="fas fa-download mr-2"></i> View Reports
                     </a>
                 </div>
             </div>

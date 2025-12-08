@@ -81,9 +81,17 @@
                 {% for upload in hod_uploads %}
                 <div class="bg-white border border-purple-200 rounded p-3">
                     <div class="flex justify-between items-start">
-                        <div>
+                        <div class="flex-1">
                             <p class="font-semibold text-gray-800">{{ upload.department.DeptName }} - {{ upload.UploadCode }}</p>
                             <p class="text-sm text-gray-600">Uploaded by {{ upload.uploader.Username }} on {{ upload.UploadDate.strftime('%d %b %Y') }}</p>
+                            <div class="flex gap-2 mt-2">
+                                <a href="{{ url_for('download_upload', upload_id=upload.UploadID) }}" class="text-green-600 hover:text-green-800 text-sm font-medium">
+                                    <i class="fas fa-file-excel mr-1"></i> Download Excel
+                                </a>
+                                <a href="{{ url_for('download_upload_pdf', upload_id=upload.UploadID) }}" class="text-red-600 hover:text-red-800 text-sm font-medium">
+                                    <i class="fas fa-file-pdf mr-1"></i> Download PDF
+                                </a>
+                            </div>
                         </div>
                         <span class="badge badge-approved">
                             <i class="fas fa-check mr-1"></i> Supervisor Approved

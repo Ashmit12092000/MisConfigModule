@@ -63,9 +63,29 @@
                     <a href="{{ url_for('template_management') }}" class="nav-link-modern">
                         <i class="fas fa-file-excel mr-1"></i>Templates
                     </a>
-                   
+
                 </div>
                 <div class="nav-separator"></div>
+                {% endif %}
+
+                <!-- Supervisor Section -->
+                {% if current_user.role.RoleName == 'Supervisor' %}
+                    <a href="{{ url_for('approval_queue') }}" class="nav-link {% if request.endpoint == 'approval_queue' %}active{% endif %}">
+                        <i class="fas fa-tasks"></i> Approval Queue
+                    </a>
+                    <a href="{{ url_for('supervisor_uploads') }}" class="nav-link {% if request.endpoint == 'supervisor_uploads' %}active{% endif %}">
+                        <i class="fas fa-check-double"></i> Review HOD Uploads
+                    </a>
+                    <a href="{{ url_for('supervisor_mis_tracking') }}" class="nav-link {% if request.endpoint == 'supervisor_mis_tracking' %}active{% endif %}">
+                        <i class="fas fa-chart-line"></i> MIS Tracking
+                    </a>
+                    <a href="{{ url_for('prepare_consolidated_mis') }}" class="nav-link {% if request.endpoint == 'prepare_consolidated_mis' %}active{% endif %}">
+                        <i class="fas fa-layer-group"></i> Prepare Consolidated MIS
+                    </a>
+                    <a href="{{ url_for('supervisor_history') }}" class="nav-link {% if request.endpoint == 'supervisor_history' %}active{% endif %}">
+                        <i class="fas fa-history"></i> History
+                    </a>
+                    <div class="nav-separator"></div>
                 {% endif %}
 
                 <!-- Upload Section -->
@@ -86,10 +106,19 @@
 
                 <!-- Management Role Section -->
                 {% if current_user.role.RoleName == 'Management' %}
-                <a href="{{ url_for('approval_queue') }}" class="nav-link-modern nav-link-highlight">
-                    <i class="fas fa-tasks mr-1"></i>Approval Queue
-                </a>
-                <div class="nav-separator"></div>
+                    <a href="{{ url_for('management_consolidated_reports') }}" class="nav-link {% if request.endpoint == 'management_consolidated_reports' %}active{% endif %}">
+                        <i class="fas fa-chart-line mr-2"></i> Individual MIS Dashboard
+                    </a>
+                    <a href="{{ url_for('consolidated_mis_dashboard') }}" class="nav-link {% if request.endpoint == 'consolidated_mis_dashboard' %}active{% endif %}">
+                        <i class="fas fa-layer-group mr-2"></i> Consolidated MIS Dashboard
+                    </a>
+                    <a href="{{ url_for('management_consolidated_queue') }}" class="nav-link {% if request.endpoint == 'management_consolidated_queue' %}active{% endif %}">
+                        <i class="fas fa-layer-group"></i> Consolidated MIS Queue
+                    </a>
+                    <a href="{{ url_for('management_history') }}" class="nav-link-modern">
+                        <i class="fas fa-list mr-1"></i>HOD Uploads
+                    </a>
+                    <div class="nav-separator"></div>
                 {% endif %}
 
                 <!-- Reports -->

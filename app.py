@@ -405,6 +405,44 @@ def logout():
     flash('Logged out successfully.', 'success')
     return redirect(url_for('login'))
 
+def analyze_excel_data(file_path):
+    """Analyze Excel file and extract key metrics"""
+    try:
+        import openpyxl
+        workbook = openpyxl.load_workbook(file_path, data_only=True)
+        sheet = workbook.active
+        
+        # Get total rows and columns
+        total_rows = sheet.max_row - 1  # Exclude header
+        total_columns = sheet.max_column
+        
+        # Extract numeric data for analysis
+        numeric_data = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            for cell in row:
+                if isinstance(cell, (int, float)) and cell is not None:
+                    numeric_data.append(cell)
+        
+        # Calculate metrics
+        total_records = total_rows
+        total_numeric_values = len(numeric_data)
+        avg_value = sum(numeric_data) / len(numeric_data) if numeric_data else 0
+        max_value = max(numeric_data) if numeric_data else 0
+        min_value = min(numeric_data) if numeric_data else 0
+        
+        return {
+            'total_records': total_records,
+            'total_columns': total_columns,
+            'total_numeric_values': total_numeric_values,
+            'average_value': round(avg_value, 2),
+            'max_value': max_value,
+            'min_value': min_value,
+            'has_data': total_records > 0
+        }
+    except Exception as e:
+        logging.error(f"Error analyzing Excel file {file_path}: {str(e)}")
+        return None
+
 @app.route('/dashboard')
 @login_required
 def dashboard():
@@ -438,6 +476,7 @@ def dashboard():
     pending_uploads_count = 0
     supervisor_pending_count = 0
     supervisor_pending_uploads = []
+    management_pending_consolidated = []
     if user.role.RoleName == 'Admin':
         hod_role = Role.query.filter_by(RoleName='HOD').first()
         if hod_role:
@@ -447,6 +486,34 @@ def dashboard():
         supervisor_pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).limit(2).all()
     if user.role.RoleName == 'Management':
         pending_uploads_count = ConsolidatedMIS.query.filter_by(Status='Pending Review').count()
+        management_pending_consolidated = ConsolidatedMIS.query.filter_by(Status='Pending Review').order_by(ConsolidatedMIS.CreatedDate.desc()).limit(2).all()
+    
+    # Analyze data from uploads
+    data_insights = {
+        'total_records': 0,
+        'total_data_points': 0,
+        'departments_reporting': set(),
+        'monthly_breakdown': {}
+    }
+    
+    # Get all approved uploads for data analysis
+    approved_uploads = MISUpload.query.filter_by(Status='Approved', IsCancelled=False).all()
+    
+    for upload in approved_uploads:
+        if os.path.exists(upload.FilePath):
+            analysis = analyze_excel_data(upload.FilePath)
+            if analysis:
+                data_insights['total_records'] += analysis['total_records']
+                data_insights['total_data_points'] += analysis['total_numeric_values']
+                data_insights['departments_reporting'].add(upload.department.DeptName)
+                
+                # Monthly breakdown
+                month_name = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][upload.MonthID]
+                if month_name not in data_insights['monthly_breakdown']:
+                    data_insights['monthly_breakdown'][month_name] = 0
+                data_insights['monthly_breakdown'][month_name] += analysis['total_records']
+    
+    data_insights['departments_count'] = len(data_insights['departments_reporting'])
     
     stats = {
         'total_users': User.query.count(),
@@ -460,7 +527,9 @@ def dashboard():
         'pending_uploads_count': pending_uploads_count,
         'supervisor_pending_count': supervisor_pending_count,
         'supervisor_pending_uploads': supervisor_pending_uploads,
-        'email_configured': email_service.is_configured()
+        'management_pending_consolidated': management_pending_consolidated,
+        'email_configured': email_service.is_configured(),
+        'data_insights': data_insights
     }
     
     # Calculate last day of current month
@@ -555,7 +624,7 @@ def reports():
                          user_role=user.role.RoleName)
 
 @app.route('/approval-queue')
-@management_required
+@supervisor_required
 def approval_queue():
     user = User.query.get(session['user_id'])
     if not user or not user.IsActive:
@@ -563,9 +632,9 @@ def approval_queue():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    # Management role - get all uploads in review status from all departments
+    # Supervisor role - get all uploads pending supervisor approval
     # Excludes cancelled uploads (when HOD deletes, upload is removed from approval queue)
-    pending_uploads = MISUpload.query.filter_by(Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
     
     return render_template('approval_queue.html', 
                          current_user=user,
@@ -860,12 +929,8 @@ def supervisor_uploads():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    current_day = date.today().day
-    if current_day < 18:
-        flash('Supervisor approval window opens on the 18th of each month.', 'info')
-        pending_uploads = []
-    else:
-        pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    # Supervisor can now view all pending uploads regardless of date
+    pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
     
     # Get supervisor approved and rejected uploads for history table
     # Match the same filtering logic as supervisor_history route for consistency
@@ -894,6 +959,191 @@ def supervisor_history():
     
     return render_template('supervisor_history.html', current_user=user, approved_uploads=approved_uploads, rejected_uploads=rejected_uploads, 
                          approved_consolidated=approved_consolidated, rejected_consolidated=rejected_consolidated, pending_consolidated=pending_consolidated)
+
+@app.route('/supervisor-mis-tracking')
+@supervisor_required
+def supervisor_mis_tracking():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get filter parameters
+    current_month = date.today().month
+    active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
+    
+    selected_month = request.args.get('month_id', str(current_month))
+    selected_fy = request.args.get('fy_id', str(active_fy.FYID) if active_fy else '1')
+    
+    # Get all active departments
+    all_departments = Department.query.filter_by(ActiveFlag=True).order_by(Department.DeptName).all()
+    
+    # Build department status list
+    department_statuses = []
+    submitted_count = 0
+    pending_review_count = 0
+    not_submitted_count = 0
+    
+    for dept in all_departments:
+        # Get HOD for this department
+        hod_role = Role.query.filter_by(RoleName='HOD').first()
+        hod = User.query.filter_by(DepartmentID=dept.DeptID, RoleID=hod_role.RoleID, IsActive=True).first() if hod_role else None
+        
+        # Get MIS upload for this department, month, and FY
+        upload = MISUpload.query.filter_by(
+            DepartmentID=dept.DeptID,
+            MonthID=int(selected_month),
+            FYID=int(selected_fy),
+            IsCancelled=False
+        ).order_by(MISUpload.UploadDate.desc()).first()
+        
+        # Count statuses
+        if upload:
+            submitted_count += 1
+            if not upload.SupervisorApproved and upload.Status == 'In Review':
+                pending_review_count += 1
+        else:
+            not_submitted_count += 1
+        
+        department_statuses.append({
+            'department_name': dept.DeptName,
+            'department_id': dept.DeptID,
+            'hod_name': hod.Username if hod else None,
+            'hod_emp_id': hod.EmpID if hod else None,
+            'upload': upload
+        })
+    
+    financial_years = FinancialYear.query.all()
+    selected_fy_obj = FinancialYear.query.get(int(selected_fy)) if selected_fy else active_fy
+    
+    return render_template('supervisor_mis_tracking.html',
+                         current_user=user,
+                         department_statuses=department_statuses,
+                         total_departments=len(all_departments),
+                         submitted_count=submitted_count,
+                         pending_review_count=pending_review_count,
+                         not_submitted_count=not_submitted_count,
+                         financial_years=financial_years,
+                         selected_month=selected_month,
+                         selected_fy=selected_fy,
+                         selected_fy_name=selected_fy_obj.FYName if selected_fy_obj else '')
+
+@app.route('/consolidated-mis-dashboard')
+@management_required
+def consolidated_mis_dashboard():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get filter parameters
+    fy_id = request.args.get('fy_id', '')
+    month_id = request.args.get('month_id', '')
+    status = request.args.get('status', '')
+    
+    # Base query - get ALL consolidated reports
+    query = ConsolidatedMIS.query
+    
+    # Apply filters only if specified
+    if fy_id:
+        query = query.filter_by(FYID=int(fy_id))
+    
+    if month_id:
+        query = query.filter_by(MonthID=int(month_id))
+    
+    if status:
+        query = query.filter_by(Status=status)
+    
+    # Get all consolidated reports sorted by most recent first
+    consolidated_reports = query.order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    
+    # Calculate statistics based on consolidated reports
+    all_consolidated = ConsolidatedMIS.query.all()
+    stats = {
+        'total_consolidated': len(all_consolidated),
+        'pending_count': ConsolidatedMIS.query.filter_by(Status='Pending Review').count(),
+        'approved_count': ConsolidatedMIS.query.filter_by(Status='Approved').count(),
+        'rejected_count': ConsolidatedMIS.query.filter_by(Status='Rejected').count()
+    }
+    
+    # Prepare chart data based on consolidated reports
+    chart_data = []
+    for report in consolidated_reports:
+        chart_data.append({
+            'MonthID': report.MonthID,
+            'Status': report.Status
+        })
+    
+    financial_years = FinancialYear.query.all()
+    
+    return render_template('consolidated_mis_dashboard.html', 
+                         current_user=user,
+                         consolidated_reports=consolidated_reports,
+                         financial_years=financial_years,
+                         stats=stats,
+                         chart_data=chart_data,
+                         selected_fy=fy_id,
+                         selected_month=month_id,
+                         selected_status=status)
+
+@app.route('/management-consolidated-reports')
+@management_required
+def management_consolidated_reports():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get filter parameters
+    fy_id = request.args.get('fy_id', '')
+    month_id = request.args.get('month_id', '')
+    status = request.args.get('status', '')
+    
+    # Get individual MIS reports (HOD uploads) with filters
+    individual_query = MISUpload.query.filter_by(IsCancelled=False)
+    
+    if fy_id:
+        individual_query = individual_query.filter_by(FYID=int(fy_id))
+    
+    if month_id:
+        individual_query = individual_query.filter_by(MonthID=int(month_id))
+    
+    if status:
+        individual_query = individual_query.filter_by(Status=status)
+    
+    individual_reports = individual_query.order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Calculate statistics based on individual reports
+    all_individual = MISUpload.query.filter_by(IsCancelled=False).all()
+    stats = {
+        'total_reports': len(all_individual),
+        'pending_count': MISUpload.query.filter_by(Status='In Review', IsCancelled=False).count(),
+        'approved_count': MISUpload.query.filter_by(Status='Approved', IsCancelled=False).count(),
+        'rejected_count': MISUpload.query.filter_by(Status='Rejected', IsCancelled=False).count()
+    }
+    
+    # Prepare chart data based on individual reports
+    chart_data = []
+    for report in individual_reports:
+        chart_data.append({
+            'MonthID': report.MonthID,
+            'Status': report.Status
+        })
+    
+    financial_years = FinancialYear.query.all()
+    
+    return render_template('management_consolidated_reports.html', 
+                         current_user=user,
+                         individual_reports=individual_reports,
+                         financial_years=financial_years,
+                         stats=stats,
+                         chart_data=chart_data,
+                         selected_fy=fy_id,
+                         selected_month=month_id,
+                         selected_status=status)
 
 @app.route('/management-consolidated-history')
 @management_required
@@ -949,12 +1199,8 @@ def view_hod_upload(upload_id):
 @supervisor_required
 def approve_hod_upload(upload_id):
     user = User.query.get(session['user_id'])
-    current_day = date.today().day
     
-    if current_day < 18:
-        flash('Supervisor approval window opens on the 18th of each month.', 'error')
-        return redirect(url_for('supervisor_uploads'))
-    
+    # Supervisor can now approve uploads regardless of date
     upload = MISUpload.query.get_or_404(upload_id)
     upload.SupervisorApproved = True
     upload.SupervisorApprovedBy = user.UserID
@@ -1006,17 +1252,26 @@ def prepare_consolidated_mis():
         flash('Your session has expired. Please log in again.', 'error')
         return redirect(url_for('login'))
     
-    current_day = date.today().day
-    if current_day < 18:
-        flash('Consolidated MIS preparation begins on the 18th.', 'info')
-        approved_uploads = []
-    else:
-        approved_uploads = MISUpload.query.filter_by(SupervisorApproved=True, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    # Supervisor can now prepare consolidated MIS anytime (no date restriction)
+    # Show all supervisor-approved uploads (including those uploaded by Admin)
+    all_approved_uploads = MISUpload.query.filter_by(SupervisorApproved=True, IsCancelled=False).filter(MISUpload.Status.in_(['In Review', 'Approved'])).order_by(MISUpload.UploadDate.desc()).all()
+    
+    # Get all consolidated MIS records to check which uploads are already included
+    all_consolidated = ConsolidatedMIS.query.all()
+    already_included_upload_ids = set()
+    
+    for consolidated in all_consolidated:
+        if consolidated.UploadedHODMISIDs:
+            upload_ids = [int(x) for x in consolidated.UploadedHODMISIDs.split(',')]
+            already_included_upload_ids.update(upload_ids)
+    
+    # Filter out uploads that are already included in any consolidated MIS
+    approved_uploads = [upload for upload in all_approved_uploads if upload.UploadID not in already_included_upload_ids]
     
     # Get all uploads with management approval/rejection status
-    in_review_uploads = MISUpload.query.filter_by(Status='In Review').order_by(MISUpload.UploadDate.desc()).all()
-    approved_by_management = MISUpload.query.filter_by(Status='Approved').order_by(MISUpload.UploadDate.desc()).all()
-    rejected_by_management = MISUpload.query.filter_by(Status='Rejected').order_by(MISUpload.UploadDate.desc()).all()
+    in_review_uploads = MISUpload.query.filter_by(Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    approved_by_management = MISUpload.query.filter_by(Status='Approved', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    rejected_by_management = MISUpload.query.filter_by(Status='Rejected', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
     
     return render_template('prepare_consolidated_mis.html', current_user=user, approved_uploads=approved_uploads, in_review_uploads=in_review_uploads, approved_by_management=approved_by_management, rejected_by_management=rejected_by_management)
 
@@ -1024,12 +1279,8 @@ def prepare_consolidated_mis():
 @supervisor_required
 def upload_consolidated_mis():
     user = User.query.get(session['user_id'])
-    current_day = date.today().day
     
-    if current_day < 18:
-        flash('Consolidated MIS submission begins on the 18th.', 'error')
-        return redirect(url_for('prepare_consolidated_mis'))
-    
+    # Supervisor can now upload consolidated MIS anytime (no date restriction)
     if 'consolidated_file' not in request.files:
         flash('No file selected.', 'error')
         return redirect(url_for('prepare_consolidated_mis'))
@@ -1050,6 +1301,17 @@ def upload_consolidated_mis():
     
     active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
     current_month = date.today().month
+    
+    # Check for duplicate consolidated MIS for the same period
+    existing_consolidated = ConsolidatedMIS.query.filter_by(
+        FYID=active_fy.FYID if active_fy else 1,
+        MonthID=current_month
+    ).first()
+    
+    if existing_consolidated:
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        flash(f'Consolidated MIS already exists for {month_names[current_month]} {active_fy.FYName if active_fy else ""}. Cannot create duplicate consolidated MIS for the same period.', 'error')
+        return redirect(url_for('prepare_consolidated_mis'))
     
     upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'ConsolidatedMIS', active_fy.FYName if active_fy else 'General')
     os.makedirs(upload_dir, exist_ok=True)
@@ -1196,9 +1458,15 @@ def reject_consolidated_mis(consolidated_id):
     return redirect(url_for('management_consolidated_queue'))
 
 @app.route('/download-consolidated-mis/<int:consolidated_id>')
-@management_required
+@login_required
 def download_consolidated_mis(consolidated_id):
     user = User.query.get(session['user_id'])
+    
+    # Allow Admin, Management, and Supervisor to download
+    if user.role.RoleName not in ['Admin', 'Management', 'Supervisor']:
+        flash('Access denied.', 'error')
+        return redirect(url_for('dashboard'))
+    
     consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
     
     from flask import send_file
@@ -1207,7 +1475,752 @@ def download_consolidated_mis(consolidated_id):
         return send_file(consolidated.ConsolidatedFilePath, as_attachment=True, download_name=filename)
     except Exception as e:
         flash(f'Error downloading file: {str(e)}', 'error')
-        return redirect(url_for('management_consolidated_queue'))
+        return redirect(url_for('dashboard'))
+
+@app.route('/download-consolidated-dashboard-excel')
+@management_required
+def download_consolidated_dashboard_excel():
+    user = User.query.get(session['user_id'])
+    
+    # Get filter parameters
+    fy_id = request.args.get('fy_id', '')
+    month_id = request.args.get('month_id', '')
+    status = request.args.get('status', '')
+    
+    # Base query
+    query = ConsolidatedMIS.query
+    
+    if fy_id:
+        query = query.filter_by(FYID=int(fy_id))
+    if month_id:
+        query = query.filter_by(MonthID=int(month_id))
+    if status:
+        query = query.filter_by(Status=status)
+    
+    consolidated_reports = query.order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Consolidated MIS Dashboard"
+        
+        # Headers
+        headers = ['ID', 'Month', 'Financial Year', 'Supervisor', 'Department', 'Created Date', 'Status', 'Approved By', 'Approved Date']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for report in consolidated_reports:
+            approver = User.query.get(report.ApprovedBy) if report.ApprovedBy else None
+            ws.append([
+                f"#{report.ConsolidatedMISID}",
+                month_names[report.MonthID],
+                report.financial_year.FYName,
+                report.supervisor.Username or report.supervisor.EmpID,
+                report.supervisor.department.DeptName,
+                report.CreatedDate.strftime('%d %b %Y'),
+                report.Status,
+                approver.Username if approver else '',
+                report.ApprovedDate.strftime('%d %b %Y') if report.ApprovedDate else ''
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='Consolidated_MIS_Dashboard.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('consolidated_mis_dashboard'))
+
+@app.route('/download-individual-dashboard-excel')
+@management_required
+def download_individual_dashboard_excel():
+    user = User.query.get(session['user_id'])
+    
+    # Get filter parameters
+    fy_id = request.args.get('fy_id', '')
+    month_id = request.args.get('month_id', '')
+    status = request.args.get('status', '')
+    
+    # Base query
+    query = MISUpload.query.filter_by(IsCancelled=False)
+    
+    if fy_id:
+        query = query.filter_by(FYID=int(fy_id))
+    if month_id:
+        query = query.filter_by(MonthID=int(month_id))
+    if status:
+        query = query.filter_by(Status=status)
+    
+    individual_reports = query.order_by(MISUpload.UploadDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Individual MIS Dashboard"
+        
+        # Headers
+        headers = ['MIS Code', 'Department', 'Month', 'Financial Year', 'Uploaded By', 'Upload Date', 'Status', 'Supervisor Approved']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for upload in individual_reports:
+            ws.append([
+                upload.UploadCode,
+                upload.department.DeptName,
+                month_names[upload.MonthID],
+                upload.financial_year.FYName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y'),
+                upload.Status,
+                'Yes' if upload.SupervisorApproved else 'No'
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='Individual_MIS_Dashboard.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('management_consolidated_reports'))
+
+@app.route('/download-reports-excel')
+@login_required
+def download_reports_excel():
+    user = User.query.get(session['user_id'])
+    
+    # Filter uploads based on role
+    if user.role.RoleName == 'Admin':
+        query = MISUpload.query
+    elif user.role.RoleName == 'Management':
+        query = MISUpload.query
+    elif user.role.RoleName == 'Supervisor':
+        query = MISUpload.query
+    else:
+        query = MISUpload.query.filter_by(DepartmentID=user.DepartmentID)
+    
+    query = query.filter_by(IsCancelled=False)
+    
+    # Apply filters
+    department_id = request.args.get('department', '')
+    fy_id = request.args.get('fy', '')
+    status = request.args.get('status', '')
+    search_code = request.args.get('search_code', '').strip()
+    
+    if search_code:
+        query = query.filter_by(UploadCode=search_code)
+    else:
+        if department_id:
+            query = query.filter_by(DepartmentID=int(department_id))
+        if fy_id:
+            query = query.filter_by(FYID=int(fy_id))
+        if status:
+            query = query.filter_by(Status=status)
+    
+    uploads = query.order_by(MISUpload.UploadDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "MIS Reports"
+        
+        # Headers
+        headers = ['MIS Code', 'Upload ID', 'Department', 'Month', 'Financial Year', 'Uploaded By', 'Upload Date', 'File Check', 'Status']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for upload in uploads:
+            ws.append([
+                upload.UploadCode,
+                f"#{upload.UploadID}",
+                upload.department.DeptName,
+                month_names[upload.MonthID],
+                upload.financial_year.FYName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y %H:%M'),
+                upload.FileCheck,
+                upload.Status
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='MIS_Reports.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('reports'))
+
+@app.route('/download-my-uploads-excel')
+@login_required
+def download_my_uploads_excel():
+    user = User.query.get(session['user_id'])
+    uploads = MISUpload.query.filter_by(DepartmentID=user.DepartmentID).order_by(MISUpload.UploadDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "My Uploads"
+        
+        # Headers
+        headers = ['MIS Code', 'Month', 'Financial Year', 'Uploaded By', 'Upload Date', 'File Check', 'Status']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for upload in uploads:
+            ws.append([
+                upload.UploadCode,
+                month_names[upload.MonthID],
+                upload.financial_year.FYName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y %H:%M'),
+                upload.FileCheck,
+                'Cancelled' if upload.IsCancelled else upload.Status
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'My_Uploads_{user.department.DeptName}.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('my_uploads'))
+
+@app.route('/download-approved-mis-excel')
+@admin_required
+def download_approved_mis_excel():
+    approved_uploads = MISUpload.query.filter_by(Status='Approved').order_by(MISUpload.UploadDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Approved MIS"
+        
+        # Headers
+        headers = ['MIS Code', 'Department', 'Month', 'Financial Year', 'Uploaded By', 'Upload Date', 'File Check', 'Status']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for upload in approved_uploads:
+            ws.append([
+                upload.UploadCode,
+                upload.department.DeptName,
+                month_names[upload.MonthID],
+                upload.financial_year.FYName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y %H:%M'),
+                upload.FileCheck,
+                upload.Status
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='Approved_MIS_Reports.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('approved_mis'))
+
+@app.route('/download-supervisor-uploads-excel')
+@supervisor_required
+def download_supervisor_uploads_excel():
+    pending_uploads = MISUpload.query.filter_by(SupervisorApproved=False, Status='In Review', IsCancelled=False).order_by(MISUpload.UploadDate.desc()).all()
+    
+    try:
+        import openpyxl
+        from io import BytesIO
+        from flask import send_file
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Pending HOD Uploads"
+        
+        # Headers
+        headers = ['MIS Code', 'Department', 'Month', 'Financial Year', 'Uploaded By', 'Upload Date', 'Status']
+        ws.append(headers)
+        
+        # Data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        for upload in pending_uploads:
+            ws.append([
+                upload.UploadCode,
+                upload.department.DeptName,
+                month_names[upload.MonthID],
+                upload.financial_year.FYName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y %H:%M'),
+                upload.Status
+            ])
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='Pending_HOD_Uploads.xlsx')
+    except Exception as e:
+        flash(f'Error generating Excel: {str(e)}', 'error')
+        return redirect(url_for('supervisor_uploads'))
+
+@app.route('/admin-consolidated-management')
+@admin_required
+def admin_consolidated_management():
+    user = User.query.get(session['user_id'])
+    
+    # Get filter parameters
+    fy_id = request.args.get('fy_id', '')
+    month_id = request.args.get('month_id', '')
+    status = request.args.get('status', '')
+    
+    # Admin can see ALL consolidated MIS records (no restrictions)
+    query = ConsolidatedMIS.query
+    
+    # Apply filters only if specified
+    if fy_id:
+        query = query.filter_by(FYID=int(fy_id))
+    if month_id:
+        query = query.filter_by(MonthID=int(month_id))
+    if status:
+        query = query.filter_by(Status=status)
+    
+    # Get all consolidated reports (including approved ones)
+    consolidated_reports = query.order_by(ConsolidatedMIS.CreatedDate.desc()).all()
+    financial_years = FinancialYear.query.all()
+    
+    return render_template('admin_consolidated_management.html',
+                         current_user=user,
+                         consolidated_reports=consolidated_reports,
+                         financial_years=financial_years,
+                         selected_fy=fy_id,
+                         selected_month=month_id,
+                         selected_status=status)
+
+@app.route('/view-admin-consolidated-mis/<int:consolidated_id>')
+@admin_required
+def view_admin_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    hod_uploads = MISUpload.query.filter(MISUpload.UploadID.in_([int(x) for x in consolidated.UploadedHODMISIDs.split(',')])).all() if consolidated.UploadedHODMISIDs else []
+    
+    # Get approver info
+    approver = User.query.get(consolidated.ApprovedBy) if consolidated.ApprovedBy else None
+    
+    return render_template('view_consolidated_mis.html',
+                         current_user=user,
+                         consolidated=consolidated,
+                         hod_uploads=hod_uploads,
+                         approver=approver)
+
+@app.route('/edit-consolidated-mis/<int:consolidated_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_consolidated_mis(consolidated_id):
+    user = User.query.get(session['user_id'])
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    if request.method == 'GET':
+        # Get approver info if exists
+        approver = User.query.get(consolidated.ApprovedBy) if consolidated.ApprovedBy else None
+        
+        return render_template('edit_consolidated_mis.html',
+                             current_user=user,
+                             consolidated=consolidated,
+                             approver=approver)
+    
+    # POST request - handle file and status update
+    status = request.form.get('status')
+    
+    # Update status
+    if status and status in ['Pending Review', 'Approved', 'Rejected']:
+        old_status = consolidated.Status
+        consolidated.Status = status
+        
+        # If status changed to Approved, set approval details
+        if status == 'Approved' and old_status != 'Approved':
+            consolidated.ApprovedBy = user.UserID
+            consolidated.ApprovedDate = datetime.now(IST)
+            
+            # Update all included HOD uploads to Approved
+            if consolidated.UploadedHODMISIDs:
+                hod_upload_ids = [int(x) for x in consolidated.UploadedHODMISIDs.split(',')]
+                for upload_id in hod_upload_ids:
+                    upload = MISUpload.query.get(upload_id)
+                    if upload:
+                        upload.Status = 'Approved'
+    
+    # Handle file replacement
+    if 'file' in request.files:
+        file = request.files['file']
+        
+        if file and file.filename:
+            if not (file.filename.endswith('.xls') or file.filename.endswith('.xlsx')):
+                flash('Only .xls or .xlsx files are allowed.', 'error')
+                return redirect(url_for('edit_consolidated_mis', consolidated_id=consolidated_id))
+            
+            # Validate Excel file
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
+            file.save(temp_path)
+            
+            is_valid, validation_message = validate_excel_file(temp_path)
+            
+            if not is_valid:
+                os.remove(temp_path)
+                flash(f'Validation Error: {validation_message}', 'error')
+                return redirect(url_for('edit_consolidated_mis', consolidated_id=consolidated_id))
+            
+            # Delete old file
+            try:
+                if os.path.exists(consolidated.ConsolidatedFilePath):
+                    os.remove(consolidated.ConsolidatedFilePath)
+            except Exception as e:
+                flash(f'Warning: Error deleting old file: {str(e)}', 'warning')
+            
+            # Move new file to upload location
+            fy = consolidated.financial_year
+            month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+            
+            upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'ConsolidatedMIS', fy.FYName)
+            os.makedirs(upload_dir, exist_ok=True)
+            
+            filename = secure_filename(f"ConsolidatedMIS_{consolidated.MonthID:02d}_{fy.FYName}_{file.filename}")
+            filepath = os.path.join(upload_dir, filename)
+            
+            os.rename(temp_path, filepath)
+            
+            # Update consolidated record
+            consolidated.ConsolidatedFilePath = filepath
+            consolidated.CreatedDate = datetime.now(IST)
+    
+    db.session.commit()
+    flash('✓ Consolidated MIS updated successfully!', 'success')
+    return redirect(url_for('admin_consolidated_management'))
+
+@app.route('/delete-consolidated-mis/<int:consolidated_id>', methods=['POST'])
+@admin_required
+def delete_consolidated_mis(consolidated_id):
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    # Delete file from storage
+    try:
+        if os.path.exists(consolidated.ConsolidatedFilePath):
+            os.remove(consolidated.ConsolidatedFilePath)
+    except Exception as e:
+        flash(f'Warning: Error deleting file: {str(e)}', 'warning')
+    
+    db.session.delete(consolidated)
+    db.session.commit()
+    
+    flash('Consolidated MIS deleted successfully!', 'success')
+    return redirect(url_for('admin_consolidated_management'))
+
+def strip_html_tags(text):
+    """Remove HTML tags from text"""
+    import re
+    if not text:
+        return ''
+    # Remove HTML tags
+    clean = re.sub('<.*?>', '', str(text))
+    return clean
+
+@app.route('/download-consolidated-pdf/<int:consolidated_id>')
+@login_required
+def download_consolidated_pdf(consolidated_id):
+    user = User.query.get(session['user_id'])
+    
+    # Allow Admin, Management, and Supervisor to download PDF
+    if user.role.RoleName not in ['Admin', 'Management', 'Supervisor']:
+        flash('Access denied.', 'error')
+        return redirect(url_for('dashboard'))
+    
+    consolidated = ConsolidatedMIS.query.get_or_404(consolidated_id)
+    
+    try:
+        import openpyxl
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from io import BytesIO
+        from flask import send_file
+        
+        # Load the Excel file
+        workbook = openpyxl.load_workbook(consolidated.ConsolidatedFilePath)
+        sheet = workbook.active
+        
+        # Prepare data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        month_name = month_names[consolidated.MonthID]
+        
+        # Get included HOD uploads
+        hod_uploads = MISUpload.query.filter(MISUpload.UploadID.in_([int(x) for x in consolidated.UploadedHODMISIDs.split(',')])).all() if consolidated.UploadedHODMISIDs else []
+        
+        # Get approver info
+        approver = User.query.get(consolidated.ApprovedBy) if consolidated.ApprovedBy else None
+        
+        # Extract headers
+        headers = []
+        for cell in sheet[1]:
+            if cell.value:
+                headers.append(str(cell.value))
+        
+        # Extract rows
+        rows = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if any(cell is not None for cell in row):
+                rows.append([str(cell) if cell is not None else '' for cell in row])
+        
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=30, leftMargin=30, topMargin=50, bottomMargin=30)
+        
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=20,
+            textColor=colors.HexColor('#1f2937'),
+            spaceAfter=6,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        )
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Normal'],
+            fontSize=12,
+            textColor=colors.HexColor('#6b7280'),
+            spaceAfter=20,
+            alignment=TA_CENTER
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#1f2937'),
+            spaceAfter=12,
+            spaceBefore=12,
+            fontName='Helvetica-Bold',
+            borderColor=colors.HexColor('#3b82f6'),
+            borderWidth=2,
+            borderPadding=8,
+            backColor=colors.HexColor('#eff6ff')
+        )
+        
+        info_style = ParagraphStyle(
+            'InfoStyle',
+            parent=styles['Normal'],
+            fontSize=10,
+            textColor=colors.HexColor('#374151'),
+            spaceAfter=6
+        )
+        
+        # Header
+        elements.append(Paragraph("CONSOLIDATED MIS REPORT", title_style))
+        elements.append(Paragraph(f"{month_name} {consolidated.financial_year.FYName}", subtitle_style))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Report Information Section
+        elements.append(Paragraph("Report Information", heading_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        info_data = [
+            ['Report ID:', f'#{consolidated.ConsolidatedMISID}', 'Month:', month_name],
+            ['Financial Year:', consolidated.financial_year.FYName, 'Status:', consolidated.Status],
+            ['Created Date:', consolidated.CreatedDate.strftime('%d %b %Y, %I:%M %p'), 'Total Departments:', str(len(hod_uploads))]
+        ]
+        
+        info_table = Table(info_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+        info_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f9fafb')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#374151')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(info_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Supervisor Information Section
+        elements.append(Paragraph("Prepared By", heading_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        supervisor_data = [
+            ['Name:', consolidated.supervisor.Username or consolidated.supervisor.EmpID, 'Employee ID:', consolidated.supervisor.EmpID],
+            ['Department:', consolidated.supervisor.department.DeptName, 'Email:', consolidated.supervisor.Email],
+            ['Role:', consolidated.supervisor.role.RoleName, 'Contact:', 'N/A']
+        ]
+        
+        supervisor_table = Table(supervisor_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+        supervisor_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#dbeafe')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1e40af')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#93c5fd')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(supervisor_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Approval Information (if approved)
+        if consolidated.Status == 'Approved' and approver:
+            elements.append(Paragraph("Approved By", heading_style))
+            elements.append(Spacer(1, 0.1*inch))
+            
+            approval_data = [
+                ['Approver:', approver.Username or approver.EmpID, 'Approved Date:', consolidated.ApprovedDate.strftime('%d %b %Y, %I:%M %p') if consolidated.ApprovedDate else 'N/A'],
+                ['Department:', approver.department.DeptName, 'Role:', approver.role.RoleName]
+            ]
+            
+            approval_table = Table(approval_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+            approval_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#d1fae5')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#065f46')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('PADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#6ee7b7')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(approval_table)
+            elements.append(Spacer(1, 0.2*inch))
+        
+        # Included Departments Section
+        elements.append(Paragraph(f"Included Department MIS Reports ({len(hod_uploads)})", heading_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        dept_headers = [['No.', 'MIS Code', 'Department', 'Uploaded By', 'Upload Date', 'Status']]
+        dept_data = []
+        for idx, upload in enumerate(hod_uploads, 1):
+            dept_data.append([
+                str(idx),
+                upload.UploadCode,
+                upload.department.DeptName,
+                upload.uploader.Username or upload.uploader.EmpID,
+                upload.UploadDate.strftime('%d %b %Y'),
+                'Approved' if upload.SupervisorApproved else 'Pending'
+            ])
+        
+        dept_table = Table(dept_headers + dept_data, colWidths=[0.4*inch, 1.2*inch, 1.5*inch, 1.5*inch, 1.2*inch, 1*inch])
+        dept_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#8b5cf6')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('TOPPADDING', (0, 0), (-1, 0), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#faf5ff')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#374151')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#c4b5fd')),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('PADDING', (0, 0), (-1, -1), 6),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(dept_table)
+        elements.append(Spacer(1, 0.3*inch))
+        
+        # MIS Data Section
+        elements.append(PageBreak())
+        elements.append(Paragraph("Consolidated MIS Data", heading_style))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Table data with all columns
+        if headers and rows:
+            # Calculate dynamic column widths based on content
+            available_width = 10.5 * inch  # landscape A4 width minus margins
+            col_count = len(headers)
+            col_width = available_width / col_count if col_count > 0 else 1*inch
+            
+            table_data = [headers] + rows
+            
+            # Create table with dynamic width
+            data_table = Table(table_data, colWidths=[col_width] * col_count, repeatRows=1)
+            data_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3b82f6')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                ('TOPPADDING', (0, 0), (-1, 0), 10),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f9fafb')),
+                ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#1f2937')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 7),
+                ('PADDING', (0, 0), (-1, -1), 4),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+            ]))
+            elements.append(data_table)
+        
+        # Footer
+        elements.append(Spacer(1, 0.3*inch))
+        footer_style = ParagraphStyle(
+            'Footer',
+            parent=styles['Normal'],
+            fontSize=8,
+            textColor=colors.HexColor('#6b7280'),
+            alignment=TA_CENTER
+        )
+        elements.append(Paragraph(f"Generated on {datetime.now(IST).strftime('%d %b %Y at %I:%M %p IST')} | Confidential Report", footer_style))
+        
+        # Build PDF
+        doc.build(elements)
+        buffer.seek(0)
+        
+        return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name=f'Consolidated_MIS_{month_name}_{consolidated.financial_year.FYName}.pdf')
+            
+    except Exception as e:
+        flash(f'Error generating PDF: {str(e)}', 'error')
+        return redirect(url_for('management_consolidated_reports'))
 
 @app.route('/download-upload/<int:upload_id>')
 @login_required
@@ -1215,8 +2228,8 @@ def download_upload(upload_id):
     user = User.query.get(session['user_id'])
     upload = MISUpload.query.get_or_404(upload_id)
     
-    # Check permissions - Admin and HOD can download all, User can only download from their department
-    if user.role.RoleName not in ['Admin', 'HOD'] and upload.DepartmentID != user.DepartmentID:
+    # Check permissions - Admin, Management, and HOD can download
+    if user.role.RoleName not in ['Admin', 'HOD', 'Management', 'Supervisor'] and upload.DepartmentID != user.DepartmentID:
         flash('Access denied.', 'error')
         return redirect(url_for('reports'))
     
@@ -1226,6 +2239,273 @@ def download_upload(upload_id):
         return send_file(upload.FilePath, as_attachment=True, download_name=filename)
     except Exception as e:
         flash(f'Error downloading file: {str(e)}', 'error')
+        return redirect(url_for('reports'))
+
+@app.route('/download-upload-pdf/<int:upload_id>')
+@login_required
+def download_upload_pdf(upload_id):
+    user = User.query.get(session['user_id'])
+    upload = MISUpload.query.get_or_404(upload_id)
+    
+    # Check permissions - Admin, Management, and HOD can download
+    if user.role.RoleName not in ['Admin', 'HOD', 'Management', 'Supervisor'] and upload.DepartmentID != user.DepartmentID:
+        flash('Access denied.', 'error')
+        return redirect(url_for('reports'))
+    
+    try:
+        import openpyxl
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from io import BytesIO
+        from flask import send_file
+        
+        # Load the Excel file
+        workbook = openpyxl.load_workbook(upload.FilePath)
+        sheet = workbook.active
+        
+        # Prepare data
+        month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+        month_name = month_names[upload.MonthID]
+        
+        # Get supervisor approval info
+        supervisor_approver = User.query.get(upload.SupervisorApprovedBy) if upload.SupervisorApprovedBy else None
+        
+        # Extract headers
+        headers = []
+        for cell in sheet[1]:
+            if cell.value:
+                headers.append(str(cell.value))
+        
+        # Extract rows
+        rows = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if any(cell is not None for cell in row):
+                rows.append([str(cell) if cell is not None else '' for cell in row])
+        
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=30, leftMargin=30, topMargin=50, bottomMargin=30)
+        
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=20,
+            textColor=colors.HexColor('#1f2937'),
+            spaceAfter=6,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        )
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Normal'],
+            fontSize=12,
+            textColor=colors.HexColor('#6b7280'),
+            spaceAfter=20,
+            alignment=TA_CENTER
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#1f2937'),
+            spaceAfter=12,
+            spaceBefore=12,
+            fontName='Helvetica-Bold',
+            borderColor=colors.HexColor('#3b82f6'),
+            borderWidth=2,
+            borderPadding=8,
+            backColor=colors.HexColor('#eff6ff')
+        )
+        
+        # Header
+        elements.append(Paragraph("DEPARTMENTAL MIS REPORT", title_style))
+        elements.append(Paragraph(f"{upload.department.DeptName} Department", subtitle_style))
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Report Information Section
+        elements.append(Paragraph("Report Information", heading_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        info_data = [
+            ['MIS Code:', upload.UploadCode, 'Upload ID:', f'#{upload.UploadID}'],
+            ['Month:', month_name, 'Financial Year:', upload.financial_year.FYName],
+            ['Department:', upload.department.DeptName, 'Upload Date:', upload.UploadDate.strftime('%d %b %Y, %I:%M %p')],
+            ['File Check:', upload.FileCheck, 'Status:', upload.Status]
+        ]
+        
+        info_table = Table(info_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+        info_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f9fafb')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#374151')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(info_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Uploader Information Section
+        elements.append(Paragraph("Uploaded By", heading_style))
+        elements.append(Spacer(1, 0.1*inch))
+        
+        uploader_data = [
+            ['Name:', upload.uploader.Username or upload.uploader.EmpID, 'Employee ID:', upload.uploader.EmpID],
+            ['Department:', upload.uploader.department.DeptName, 'Email:', upload.uploader.Email],
+            ['Role:', upload.uploader.role.RoleName, 'Upload Date:', upload.UploadDate.strftime('%d %b %Y, %I:%M %p')]
+        ]
+        
+        uploader_table = Table(uploader_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+        uploader_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#dbeafe')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1e40af')),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('PADDING', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#93c5fd')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(uploader_table)
+        elements.append(Spacer(1, 0.2*inch))
+        
+        # Approval Information
+        if upload.SupervisorApproved and supervisor_approver:
+            elements.append(Paragraph("Supervisor Approval", heading_style))
+            elements.append(Spacer(1, 0.1*inch))
+            
+            approval_data = [
+                ['Approved By:', supervisor_approver.Username or supervisor_approver.EmpID, 'Approval Date:', upload.SupervisorApprovedDate.strftime('%d %b %Y, %I:%M %p') if upload.SupervisorApprovedDate else 'N/A'],
+                ['Supervisor Dept:', supervisor_approver.department.DeptName, 'Status:', 'Approved']
+            ]
+            
+            approval_table = Table(approval_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+            approval_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#d1fae5')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#065f46')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('PADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#6ee7b7')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(approval_table)
+            elements.append(Spacer(1, 0.2*inch))
+        
+        # Management Approval (if status is Approved)
+        if upload.Status == 'Approved':
+            elements.append(Paragraph("Management Approval", heading_style))
+            elements.append(Spacer(1, 0.1*inch))
+            
+            mgmt_data = [
+                ['Status:', 'Approved by Management', 'Final Status:', upload.Status]
+            ]
+            
+            mgmt_table = Table(mgmt_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
+            mgmt_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#d1fae5')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#065f46')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('PADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#6ee7b7')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(mgmt_table)
+            elements.append(Spacer(1, 0.2*inch))
+        
+        # Additional Metadata
+        if upload.IsModified or upload.IsCancelled:
+            elements.append(Paragraph("Additional Information", heading_style))
+            elements.append(Spacer(1, 0.1*inch))
+            
+            metadata = []
+            if upload.IsModified:
+                metadata.append(['Modified:', 'Yes - This report has been modified after initial submission'])
+            if upload.IsCancelled:
+                metadata.append(['Cancelled:', 'Yes - This report was cancelled by the uploader'])
+            
+            metadata_table = Table(metadata, colWidths=[1.5*inch, 5.5*inch])
+            metadata_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fef3c7')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#78350f')),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('PADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#fde68a')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(metadata_table)
+            elements.append(Spacer(1, 0.2*inch))
+        
+        # MIS Data Section
+        elements.append(PageBreak())
+        elements.append(Paragraph("Departmental MIS Data", heading_style))
+        elements.append(Spacer(1, 0.15*inch))
+        
+        # Table data with all columns
+        if headers and rows:
+            # Calculate dynamic column widths
+            available_width = 10.5 * inch
+            col_count = len(headers)
+            col_width = available_width / col_count if col_count > 0 else 1*inch
+            
+            table_data = [headers] + rows
+            
+            data_table = Table(table_data, colWidths=[col_width] * col_count, repeatRows=1)
+            data_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3b82f6')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                ('TOPPADDING', (0, 0), (-1, 0), 10),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f9fafb')),
+                ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#1f2937')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 7),
+                ('PADDING', (0, 0), (-1, -1), 4),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+            ]))
+            elements.append(data_table)
+        
+        # Footer
+        elements.append(Spacer(1, 0.3*inch))
+        footer_style = ParagraphStyle(
+            'Footer',
+            parent=styles['Normal'],
+            fontSize=8,
+            textColor=colors.HexColor('#6b7280'),
+            alignment=TA_CENTER
+        )
+        elements.append(Paragraph(f"Generated on {datetime.now(IST).strftime('%d %b %Y at %I:%M %p IST')} | MIS Code: {upload.UploadCode} | Confidential Report", footer_style))
+        
+        # Build PDF
+        doc.build(elements)
+        buffer.seek(0)
+        
+        return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name=f'MIS_{upload.UploadCode}_{upload.department.DeptName}_{month_name}_{upload.financial_year.FYName}.pdf')
+            
+    except Exception as e:
+        flash(f'Error generating PDF: {str(e)}', 'error')
         return redirect(url_for('reports'))
 
 @app.route('/delete-upload/<int:upload_id>', methods=['POST'])
@@ -1250,7 +2530,7 @@ def delete_upload(upload_id):
         db.session.delete(upload)
         db.session.commit()
         flash('Upload deleted successfully!', 'success')
-        return redirect(url_for('reports'))
+        return redirect(url_for('approved_mis') if upload.Status == 'Approved' else url_for('reports'))
     
     # HOD can only delete "In Review" uploads from their department
     if user.role.RoleName == 'HOD':
@@ -1292,7 +2572,9 @@ def edit_upload(upload_id):
     # Check permissions
     # Admin can edit any upload anytime
     # HOD can only edit "In Review" uploads from their department
-    if user.role.RoleName == 'HOD':
+    if user.role.RoleName == 'Admin':
+        pass  # Admin can edit any upload
+    elif user.role.RoleName == 'HOD':
         if upload.DepartmentID != user.DepartmentID:
             flash('You can only edit uploads from your department.', 'error')
             return redirect(url_for('my_uploads'))
@@ -1300,7 +2582,7 @@ def edit_upload(upload_id):
         if upload.Status != 'In Review':
             flash(f'Cannot modify uploads with status "{upload.Status}". Only "In Review" uploads can be modified.', 'error')
             return redirect(url_for('my_uploads'))
-    elif user.role.RoleName != 'Admin':
+    else:
         flash('You do not have permission to edit uploads.', 'error')
         return redirect(url_for('reports'))
     
@@ -1945,23 +3227,23 @@ def upload_mis():
     dept = Department.query.get(department_id)
     month_names = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
     
+    # Check for duplicate uploads - same department, month, and FY (not cancelled)
+    existing_upload = MISUpload.query.filter_by(
+        DepartmentID=int(department_id),
+        MonthID=int(month_id),
+        FYID=int(fy_id),
+        IsCancelled=False
+    ).first()
+    
+    if existing_upload:
+        flash(f'MIS upload already exists for {dept.DeptName} - {month_names[int(month_id)]} {fy.FYName}. Please delete or modify the existing upload instead.', 'error')
+        return redirect(url_for('mis_upload'))
+    
     # HOD users can only upload for current month
     if user.role.RoleName == 'HOD':
         current_month = date.today().month
         if int(month_id) != current_month:
             flash(f'HOD users can only upload MIS data for the current month (Month {current_month}). Old month uploads are not allowed.', 'error')
-            return redirect(url_for('mis_upload'))
-        
-        # Check if HOD already has an approved MIS for current month and FY
-        approved_upload = MISUpload.query.filter_by(
-            DepartmentID=user.DepartmentID,
-            MonthID=current_month,
-            FYID=fy_id,
-            Status='Approved'
-        ).first()
-        
-        if approved_upload:
-            flash(f'An approved MIS upload already exists for {month_names[current_month]} {fy.FYName}. No new uploads are allowed for this period.', 'error')
             return redirect(url_for('mis_upload'))
     
     # HOD can only upload for their own department
@@ -1989,8 +3271,8 @@ def upload_mis():
         flash(f'Validation Error: {validation_message}', 'error')
         return redirect(url_for('mis_upload'))
     
-    # Admin uploads are auto-approved, others go to review queue for Management approval
-    upload_status = 'Approved' if user.role.RoleName == 'Admin' else 'In Review'
+    # All uploads (including Admin) go to Supervisor for approval first
+    upload_status = 'In Review'
     
     # Generate unique MIS code
     mis_code = generate_mis_code(int(department_id))
@@ -2008,7 +3290,7 @@ def upload_mis():
     db.session.add(upload)
     db.session.commit()
     
-    flash(f'✓ File Validation Success: {validation_message} File uploaded successfully and is now pending Management review.', 'success')
+    flash(f'✓ File Validation Success: {validation_message} File uploaded successfully and is now pending Supervisor review.', 'success')
     return redirect(url_for('mis_upload'))
 
 @app.route('/template-management')

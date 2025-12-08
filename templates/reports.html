@@ -13,9 +13,14 @@
 
     <!-- Filter Section -->
     <div class="card p-6 mb-6">
-        <h3 class="text-xl font-bold mb-4 flex items-center gap-2">
-            <i class="fas fa-filter text-blue-600"></i> Filter & Search Reports
-        </h3>
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-xl font-bold flex items-center gap-2">
+                <i class="fas fa-filter text-blue-600"></i> Filter & Search Reports
+            </h3>
+            <a href="{{ url_for('download_reports_excel') }}?department={{ selected_department }}&fy={{ selected_fy }}&status={{ selected_status }}&search_code={{ search_code }}" class="btn bg-green-600 text-white hover:bg-green-700 px-6 py-2">
+                <i class="fas fa-file-excel mr-2"></i> Export to Excel
+            </a>
+        </div>
         
         <!-- Search by MIS Code -->
         <div class="mb-4">
