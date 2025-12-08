@@ -1029,6 +1029,160 @@ def supervisor_mis_tracking():
                          selected_fy=selected_fy,
                          selected_fy_name=selected_fy_obj.FYName if selected_fy_obj else '')
 
+@app.route('/admin-mis-tracking')
+@admin_required
+def admin_mis_tracking():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get filter parameters
+    current_month = date.today().month
+    active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
+    
+    selected_month = request.args.get('month_id', str(current_month))
+    selected_fy = request.args.get('fy_id', str(active_fy.FYID) if active_fy else '1')
+    
+    # Get all active departments
+    all_departments = Department.query.filter_by(ActiveFlag=True).order_by(Department.DeptName).all()
+    
+    # Build department status list
+    department_statuses = []
+    submitted_count = 0
+    pending_review_count = 0
+    not_submitted_count = 0
+    approved_count = 0
+    rejected_count = 0
+    
+    for dept in all_departments:
+        # Get HOD for this department
+        hod_role = Role.query.filter_by(RoleName='HOD').first()
+        hod = User.query.filter_by(DepartmentID=dept.DeptID, RoleID=hod_role.RoleID, IsActive=True).first() if hod_role else None
+        
+        # Get MIS upload for this department, month, and FY
+        upload = MISUpload.query.filter_by(
+            DepartmentID=dept.DeptID,
+            MonthID=int(selected_month),
+            FYID=int(selected_fy),
+            IsCancelled=False
+        ).order_by(MISUpload.UploadDate.desc()).first()
+        
+        # Count statuses
+        if upload:
+            submitted_count += 1
+            if upload.Status == 'In Review':
+                pending_review_count += 1
+            elif upload.Status == 'Approved':
+                approved_count += 1
+            elif upload.Status == 'Rejected':
+                rejected_count += 1
+        else:
+            not_submitted_count += 1
+        
+        department_statuses.append({
+            'department_name': dept.DeptName,
+            'department_id': dept.DeptID,
+            'hod_name': hod.Username if hod else None,
+            'hod_emp_id': hod.EmpID if hod else None,
+            'upload': upload
+        })
+    
+    financial_years = FinancialYear.query.all()
+    selected_fy_obj = FinancialYear.query.get(int(selected_fy)) if selected_fy else active_fy
+    
+    return render_template('admin_mis_tracking.html',
+                         current_user=user,
+                         department_statuses=department_statuses,
+                         total_departments=len(all_departments),
+                         submitted_count=submitted_count,
+                         pending_review_count=pending_review_count,
+                         not_submitted_count=not_submitted_count,
+                         approved_count=approved_count,
+                         rejected_count=rejected_count,
+                         financial_years=financial_years,
+                         selected_month=selected_month,
+                         selected_fy=selected_fy,
+                         selected_fy_name=selected_fy_obj.FYName if selected_fy_obj else '')
+
+@app.route('/management-mis-tracking')
+@management_required
+def management_mis_tracking():
+    user = User.query.get(session['user_id'])
+    if not user or not user.IsActive:
+        session.clear()
+        flash('Your session has expired. Please log in again.', 'error')
+        return redirect(url_for('login'))
+    
+    # Get filter parameters
+    current_month = date.today().month
+    active_fy = FinancialYear.query.filter_by(ActiveFlag=True).first()
+    
+    selected_month = request.args.get('month_id', str(current_month))
+    selected_fy = request.args.get('fy_id', str(active_fy.FYID) if active_fy else '1')
+    
+    # Get all active departments
+    all_departments = Department.query.filter_by(ActiveFlag=True).order_by(Department.DeptName).all()
+    
+    # Build department status list
+    department_statuses = []
+    submitted_count = 0
+    pending_review_count = 0
+    not_submitted_count = 0
+    approved_count = 0
+    rejected_count = 0
+    
+    for dept in all_departments:
+        # Get HOD for this department
+        hod_role = Role.query.filter_by(RoleName='HOD').first()
+        hod = User.query.filter_by(DepartmentID=dept.DeptID, RoleID=hod_role.RoleID, IsActive=True).first() if hod_role else None
+        
+        # Get MIS upload for this department, month, and FY
+        upload = MISUpload.query.filter_by(
+            DepartmentID=dept.DeptID,
+            MonthID=int(selected_month),
+            FYID=int(selected_fy),
+            IsCancelled=False
+        ).order_by(MISUpload.UploadDate.desc()).first()
+        
+        # Count statuses
+        if upload:
+            submitted_count += 1
+            if upload.Status == 'In Review':
+                pending_review_count += 1
+            elif upload.Status == 'Approved':
+                approved_count += 1
+            elif upload.Status == 'Rejected':
+                rejected_count += 1
+        else:
+            not_submitted_count += 1
+        
+        department_statuses.append({
+            'department_name': dept.DeptName,
+            'department_id': dept.DeptID,
+            'hod_name': hod.Username if hod else None,
+            'hod_emp_id': hod.EmpID if hod else None,
+            'upload': upload
+        })
+    
+    financial_years = FinancialYear.query.all()
+    selected_fy_obj = FinancialYear.query.get(int(selected_fy)) if selected_fy else active_fy
+    
+    return render_template('management_mis_tracking.html',
+                         current_user=user,
+                         department_statuses=department_statuses,
+                         total_departments=len(all_departments),
+                         submitted_count=submitted_count,
+                         pending_review_count=pending_review_count,
+                         not_submitted_count=not_submitted_count,
+                         approved_count=approved_count,
+                         rejected_count=rejected_count,
+                         financial_years=financial_years,
+                         selected_month=selected_month,
+                         selected_fy=selected_fy,
+                         selected_fy_name=selected_fy_obj.FYName if selected_fy_obj else '')
+
 @app.route('/consolidated-mis-dashboard')
 @management_required
 def consolidated_mis_dashboard():
